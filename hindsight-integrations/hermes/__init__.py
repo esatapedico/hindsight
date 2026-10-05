@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -333,6 +334,21 @@ def _mint_document_id(session_id: str) -> str:
     return f"{session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
 
+def _is_entry_line(line: str) -> bool:
+    """True for a top-level recall entry — a ``-``/``*`` bullet in column 0. Indented lines
+    are a bullet's continuation (its provenance), never an entry of their own, so a nested
+    bullet under an entry is dropped with that entry instead of being orphaned."""
+    return line[:1] in ("-", "*")
+
+
+def _entry_digest(entry: str) -> str:
+    """SHA-1 hex of one rendered entry: the exact-match key for session dedup. Not a security
+    primitive — a cheap content fingerprint, ~2^80 collision odds against a session's few
+    thousand short entries. Exact equality only; see ``_drop_repeated_entries`` for why a
+    similarity threshold is not safe here."""
+    return hashlib.sha1(entry.encode("utf-8")).hexdigest()
+
+
 # initialize() kwargs copied verbatim (str, stripped) onto ``self._<name>``.
 _SESSION_KWARGS = (
     "platform",
@@ -436,6 +452,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
+        # SHA-1 digests of the entries already injected in THIS session, so a memory Hindsight
+        # re-ranks every turn reaches the model (and the transcript) only once. Session-scoped:
+        # cleared on every session boundary, see _forget_seen_entries.
+        self._seen_entry_dashes: set[str] = set()
         self._apply_recall_settings({})
 
     @property
@@ -994,6 +1014,9 @@ class HindsightMemoryProvider(MemoryProvider):
             setattr(self, f"_{name}", str(kwargs.get(name) or "").strip())
         self._turn_index = self._last_retained_turn_count = 0
         self._session_turns = []
+        # Same reasoning as the batch buffers above: re-initializing starts a session, so the
+        # previous one's dedup set must not suppress entries the new transcript has never seen.
+        self._forget_seen_entries()
         self._mode = cfg.get("mode", "cloud")
         self._timeout = self._int_setting("timeout", "HINDSIGHT_TIMEOUT", _DEFAULT_TIMEOUT)
         self._idle_timeout = self._int_setting("idle_timeout", "HINDSIGHT_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT)
@@ -1279,8 +1302,82 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
 
+    def _forget_seen_entries(self) -> None:
+        """Drop the session's dedup set at a session boundary.
+
+        Required, not an optimisation: Hermes compresses a long session's transcript away, so
+        after a boundary the transcript no longer holds the entries we recorded and suppressing
+        them again would strip the model of memories it can no longer see. The set is
+        per-provider, so a fresh session starts empty on its own too.
+        """
+        if not self._seen_entry_dashes:
+            return
+        logger.debug(
+            "Prefetch: forgetting %d already-seen entr(ies) at a session boundary", len(self._seen_entry_dashes)
+        )
+        self._seen_entry_dashes.clear()
+
+    def _drop_repeated_entries(self, result: str) -> tuple[str, int]:
+        """Drop entries already returned earlier in this session -> (text, entries dropped).
+
+        Hindsight re-ranks overlapping observations on every turn, so the same entry came back
+        on ~3 of every 4 slots of a measured 94-turn session: those duplicates were not just
+        wasted prompt tokens, they were written into Hermes' ``api_content`` sidecar and
+        replayed from the transcript on every later request, forever.
+
+        Matching is EXACT SHA-1 equality, deliberately: "deployment is feasible" and
+        "deployment is not feasible" are ~0.88 similar, and a similarity threshold would
+        silently discard the negation and quietly reverse the model's conclusion.
+
+        An entry is its bullet plus every line under it, so a dropped entry takes its own
+        provenance with it. Text before the first bullet is prose (a preamble or, on the
+        reflect path, the whole synthesis) and passes through untouched. Nothing dropped ->
+        the ORIGINAL string back, byte for byte: Hermes' prompt cache keys off the exact prefix
+        bytes, so a re-serialized no-op would cost the cache on every turn.
+        """
+        if not result:
+            return "", 0
+        prose: list[str] = []
+        entries: list[list[str]] = []
+        current: Optional[list[str]] = None
+        for line in result.split("\n"):
+            if _is_entry_line(line):
+                current = [line]
+                entries.append(current)
+            elif current is not None:
+                current.append(line)  # indented (or bare) continuation — stays with its bullet
+            else:
+                prose.append(line)
+        if not entries:
+            return result, 0
+        kept: list[str] = []
+        dropped = 0
+        for entry in entries:
+            digest = _entry_digest("\n".join(entry).rstrip())
+            if digest in self._seen_entry_dashes:
+                dropped += 1
+                continue
+            self._seen_entry_dashes.add(digest)
+            kept.extend(entry)
+        if not dropped:
+            return result, 0
+        logger.debug("Prefetch: dropped %d of %d already-seen entr(ies) this session", dropped, len(entries))
+        # Re-splitting and rejoining preserves the original line order exactly, so the kept
+        # entries are byte-identical to the lines they were cut from.
+        return "\n".join(prose + kept), dropped
+
     def _finish_prefetch(self, result: str, count: int) -> str:
-        """Record indicator state (cleared on empty turns, never a stale count); format the block."""
+        """Record indicator state (cleared on empty turns, never a stale count); format the block.
+
+        The one place both prefetch paths converge (see prefetch), so the session dedup runs
+        here: filtering upstream would miss the recall_sync path, and filtering downstream would
+        mean splitting the header back off. Entry blocks arrive before the header is prepended,
+        which is also what keeps the header out of the digest set.
+        """
+        result, dropped = self._drop_repeated_entries(result)
+        # The indicator reports what was INJECTED, so a dropped entry must leave the count —
+        # but only when one was dropped, leaving the existing no-drop path untouched.
+        count = max(count - dropped, 0) if dropped else count
         self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
         if not result:
             logger.debug("Prefetch: no results available")
@@ -1558,6 +1655,37 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- session lifecycle -------------------------------------------------------
 
+    def _delegate_session_hook(self, name: str, *args, **kwargs) -> None:
+        """Run ``MemoryProvider``'s own hook of *name*, when this Hermes version defines one.
+
+        The overrides below only forget the dedup set, so they must stay purely additive: Hermes
+        owns the rest of each hook (retaining the end-of-session transcript, rotating the
+        document), and a Hermes whose base class has no such hook must still load the plugin.
+        """
+        hook = getattr(super(), name, None)
+        if callable(hook):
+            hook(*args, **kwargs)
+
+    def on_session_start(self, *args, **kwargs) -> None:
+        """Forget entries seen before the boundary.
+
+        Also fires after a durable compression (``boundary_reason="compression"``): the
+        transcript was rewritten without them, so the model can no longer see what it was told —
+        keeping them suppressed would strip it of memories for the rest of the session.
+        """
+        self._forget_seen_entries()
+        self._delegate_session_hook("on_session_start", *args, **kwargs)
+
+    def on_session_reset(self, *args, **kwargs) -> None:
+        """Reset boundary (/reset, /new): the new session starts with an empty dedup set."""
+        self._forget_seen_entries()
+        self._delegate_session_hook("on_session_reset", *args, **kwargs)
+
+    def on_session_end(self, *args, **kwargs) -> None:
+        """End boundary (the transcript arrives as the first positional argument)."""
+        self._forget_seen_entries()
+        self._delegate_session_hook("on_session_end", *args, **kwargs)
+
     def on_session_switch(
         self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs
     ) -> None:
@@ -1615,6 +1743,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
+        # Same reasoning as the batch buffers: /resume, /branch and /new all continue or replace
+        # the transcript, and Hermes fires this hook after a durable compression too — the entries
+        # we recorded are gone from it, so the new session must re-receive them.
+        self._forget_seen_entries()
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id,
