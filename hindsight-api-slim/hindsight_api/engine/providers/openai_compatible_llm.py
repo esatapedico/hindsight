@@ -1276,13 +1276,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         first_msg = call_params["messages"][0]
                         if isinstance(first_msg, dict) and isinstance(first_msg.get("content"), str):
                             first_msg["content"] = schema_msg + "\n\n" + first_msg["content"]
-                # Providers that skip json_object grammar enforcement
-                skip_grammar = self.provider in ("lmstudio", "ollama", "volcano")
-                if self.provider == "llamacpp":
-                    from hindsight_api.config import get_config
-
-                    skip_grammar = get_config().llamacpp_no_grammar
-                if not skip_grammar:
+                if self._supports_json_mode():
                     call_params["messages"] = _ensure_json_word_in_user_message(call_params["messages"])
                     call_params["response_format"] = {"type": "json_object"}
 
@@ -2149,6 +2143,18 @@ class OpenAICompatibleLLM(LLMInterface):
         if last_exception:
             raise last_exception
         raise RuntimeError("Ollama call failed after all retries")
+
+    def _supports_json_mode(self) -> bool:
+        """Whether to send ``json_object`` on the soft path, or the schema in the prompt only."""
+        from hindsight_api.config import get_config
+
+        config = get_config()
+        if config.llm_openai_compatible_json_mode is not None:
+            return config.llm_openai_compatible_json_mode
+        if self.provider == "llamacpp":
+            return not config.llamacpp_no_grammar
+        # These don't honour json_object reliably.
+        return self.provider not in ("lmstudio", "ollama", "volcano")
 
     def supports_vision(self) -> bool | None:
         """Known only for OpenAI itself; unknown for every other backend here.
