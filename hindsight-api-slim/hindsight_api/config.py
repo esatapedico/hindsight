@@ -203,6 +203,13 @@ ENV_LLM_STRUCTURED_OUTPUT_FORCED_TOOL = "HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FOR
 # identify — and the off switch for an endpoint that rejects images despite its
 # model name.
 ENV_LLM_VISION = "HINDSIGHT_API_LLM_VISION"
+# Whether the backend honours OpenAI's ``response_format={"type": "json_object"}``.
+# Tri-state like ENV_LLM_VISION: unset lets the provider decide (LM Studio, Ollama
+# and Volcano say no; llama.cpp follows HINDSIGHT_API_LLAMACPP_NO_GRAMMAR; the rest
+# say yes). When false, the soft path sends the schema in the prompt only. Needed
+# for ``provider=openai`` pointed at a local server that can't constrain output and
+# instead rewrites the prompt in ways a thinking model can loop on (issue #4935).
+ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE = "HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE"
 ENV_LLM_SEND_BANK_AS_USER = "HINDSIGHT_API_LLM_SEND_BANK_AS_USER"
 ENV_LLM_OLLAMA_NUM_CTX = "HINDSIGHT_API_LLM_OLLAMA_NUM_CTX"
 
@@ -567,7 +574,10 @@ ENV_EMBEDDINGS_LITELLM_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_LITELLM_DIMENSIONS
 ENV_RERANKER_LITELLM_API_BASE = "HINDSIGHT_API_RERANKER_LITELLM_API_BASE"
 ENV_RERANKER_LITELLM_API_KEY = "HINDSIGHT_API_RERANKER_LITELLM_API_KEY"
 ENV_RERANKER_LITELLM_MODEL = "HINDSIGHT_API_RERANKER_LITELLM_MODEL"
+# Deprecated alias of ENV_RERANKER_MAX_TOKENS_PER_CANDIDATE, folded into it at load time.
 ENV_RERANKER_LITELLM_MAX_TOKENS_PER_DOC = "HINDSIGHT_API_RERANKER_LITELLM_MAX_TOKENS_PER_DOC"
+# Provider-agnostic per-candidate truncation cap (tokens, see ENV_TOKENIZER_ENCODING).
+ENV_RERANKER_MAX_TOKENS_PER_CANDIDATE = "HINDSIGHT_API_RERANKER_MAX_TOKENS_PER_CANDIDATE"
 
 # LiteLLM SDK configuration (direct API access, no proxy needed)
 ENV_EMBEDDINGS_LITELLM_SDK_API_KEY = "HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY"
@@ -906,6 +916,7 @@ ENV_DB_POOL_MIN_SIZE = "HINDSIGHT_API_DB_POOL_MIN_SIZE"
 ENV_DB_POOL_MAX_SIZE = "HINDSIGHT_API_DB_POOL_MAX_SIZE"
 ENV_DB_COMMAND_TIMEOUT = "HINDSIGHT_API_DB_COMMAND_TIMEOUT"
 ENV_DB_ACQUIRE_TIMEOUT = "HINDSIGHT_API_DB_ACQUIRE_TIMEOUT"
+ENV_DB_POOL_SLOW_ACQUIRE_THRESHOLD_SECONDS = "HINDSIGHT_API_DB_POOL_SLOW_ACQUIRE_THRESHOLD_SECONDS"
 ENV_DB_STATEMENT_TIMEOUT = "HINDSIGHT_API_DB_STATEMENT_TIMEOUT"
 ENV_DB_MAX_PARALLEL_WORKERS_PER_GATHER = "HINDSIGHT_API_DB_MAX_PARALLEL_WORKERS_PER_GATHER"
 ENV_DB_SESSION_SETUP_ON_ACQUIRE = "HINDSIGHT_API_DB_SESSION_SETUP_ON_ACQUIRE"
@@ -1474,7 +1485,10 @@ DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA = "paradedb"
 DEFAULT_LITELLM_API_BASE = "http://localhost:4000"
 DEFAULT_EMBEDDINGS_LITELLM_MODEL = "text-embedding-3-small"
 DEFAULT_RERANKER_LITELLM_MODEL = "cohere/rerank-english-v3.0"
-DEFAULT_RERANKER_LITELLM_MAX_TOKENS_PER_DOC: int | None = None
+# Per-candidate truncation before rerank, applied to every provider. Off by default;
+# set it to the model's context window (or lower, to bound request size on a CPU-only
+# rerank server).
+DEFAULT_RERANKER_MAX_TOKENS_PER_CANDIDATE: int | None = None
 
 # LiteLLM SDK defaults
 DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL = "cohere/embed-english-v3.0"
@@ -1796,6 +1810,7 @@ DEFAULT_DB_POOL_MIN_SIZE = 5
 DEFAULT_DB_POOL_MAX_SIZE = 100
 DEFAULT_DB_COMMAND_TIMEOUT = 60  # seconds
 DEFAULT_DB_ACQUIRE_TIMEOUT = 30  # seconds
+DEFAULT_DB_POOL_SLOW_ACQUIRE_THRESHOLD_SECONDS = 0.05  # 0 disables the warning
 DEFAULT_DB_STATEMENT_TIMEOUT = 600  # seconds (Postgres statement_timeout applied on every pool connection; 0 disables)
 # Optional cap on Postgres planner parallelism for this process's pool
 # connections (SET max_parallel_workers_per_gather). None leaves the server
@@ -1829,9 +1844,11 @@ DEFAULT_DB_MAX_PARALLEL_WORKERS_PER_GATHER: int | None = None
 DEFAULT_DB_SESSION_SETUP_ON_ACQUIRE = True
 # pg_trgm similarity threshold applied on every pool connection (SET
 # pg_trgm.similarity_threshold). Governs how close a name must be for the `%`
-# operator to treat it as a candidate during entity resolution: lower catches
-# more substring-ish matches at higher CPU cost, higher is stricter and cheaper.
-DEFAULT_ENTITY_TRGM_SIMILARITY_THRESHOLD = 0.15
+# operator to treat it as a candidate during entity resolution. Never applied below
+# ENTITY_MERGE_MIN_SIMILARITY (see HindsightConfig.entity_trgm_probe_threshold). It used to
+# default to 0.15 while the merge floor is 0.3, so about half the candidates were fetched,
+# scored and always discarded (#5367). Raise it above the floor to look at fewer, closer names.
+DEFAULT_ENTITY_TRGM_SIMILARITY_THRESHOLD = 0.3
 # pg_trgm similarity at/above which two brand-new names created by the SAME retain are merged
 # into one entity (in-batch dedup — surface-form variants that would otherwise each create a
 # distinct row). pg_trgm ignores non-alphanumerics, so decoration variants score ~1.0 and
@@ -1841,14 +1858,14 @@ DEFAULT_ENTITY_TRGM_SIMILARITY_THRESHOLD = 0.15
 DEFAULT_ENTITY_INTRABATCH_MERGE_SIMILARITY = 0.5
 # Minimum pg_trgm similarity a name must have with an EXISTING entity before that entity can
 # be reused for it. The composite resolution score (name + co-occurrence + recency) has no
-# floor of its own, so without this a name the trigram probe merely admitted as a candidate
-# (>= ENTITY_TRGM_SIMILARITY_THRESHOLD, 0.15) could still be merged onto purely because the
-# bank had seen it recently alongside the same entities — attributing a new person's facts to
-# an unrelated entity (#3751). Applied as a gate, not as a replacement for the name score, so
-# anything that merges above it is unaffected. Sits between the recall threshold (0.15) and the
-# stricter same-batch fold-in cutoff (ENTITY_INTRABATCH_MERGE_SIMILARITY, 0.5). Lower it for
-# corpora of very short names, where trigram similarity is unavoidably low ("Jon"/"John" is
-# 0.29); raise it to merge only clear surface variants.
+# floor of its own, so without this a name a candidate probe merely admitted could still be
+# merged onto purely because the bank had seen it recently alongside the same entities —
+# attributing a new person's facts to an unrelated entity (#3751). Applied as a gate, not as a
+# replacement for the name score, so anything that merges above it is unaffected. Also the
+# lowest threshold the pg_trgm probe runs at; below the stricter same-batch fold-in cutoff
+# (ENTITY_INTRABATCH_MERGE_SIMILARITY, 0.5). Lower it for corpora of very short names, where
+# trigram similarity is unavoidably low ("Jon"/"John" is 0.29); raise it to merge only clear
+# surface variants.
 DEFAULT_ENTITY_MERGE_MIN_SIMILARITY = 0.3
 DEFAULT_MODEL_INIT_TIMEOUT = 300  # seconds (cap on startup model/connection init; covers first-time downloads)
 
@@ -2681,6 +2698,8 @@ class RerankerMemberConfig:
 
     index: int
     provider: str
+    # Provider-agnostic per-candidate token cap; None disables truncation.
+    max_tokens_per_candidate: int | None
     # local
     local_model: str
     local_force_cpu: bool
@@ -2714,7 +2733,6 @@ class RerankerMemberConfig:
     litellm_api_base: str
     litellm_api_key: str | None
     litellm_model: str
-    litellm_max_tokens_per_doc: int | None
     litellm_timeout: float
     # litellm-sdk
     litellm_sdk_api_key: str | None
@@ -2834,6 +2852,12 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
             RerankerMemberConfig(
                 index=index,
                 provider=provider,
+                # Generic name, falling back to the deprecated LiteLLM-specific alias.
+                max_tokens_per_candidate=_member_opt_int(
+                    base,
+                    "MAX_TOKENS_PER_CANDIDATE",
+                    _member_opt_int(base, "LITELLM_MAX_TOKENS_PER_DOC", DEFAULT_RERANKER_MAX_TOKENS_PER_CANDIDATE),
+                ),
                 local_model=_member_str(base, "LOCAL_MODEL", DEFAULT_RERANKER_LOCAL_MODEL),
                 local_force_cpu=_member_bool(base, "LOCAL_FORCE_CPU", DEFAULT_RERANKER_LOCAL_FORCE_CPU),
                 local_max_concurrent=_member_int(base, "LOCAL_MAX_CONCURRENT", DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT),
@@ -2867,9 +2891,6 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 litellm_api_base=_member_str(base, "LITELLM_API_BASE", DEFAULT_LITELLM_API_BASE),
                 litellm_api_key=_member_opt_str(base, "LITELLM_API_KEY"),
                 litellm_model=_member_str(base, "LITELLM_MODEL", DEFAULT_RERANKER_LITELLM_MODEL),
-                litellm_max_tokens_per_doc=_member_opt_int(
-                    base, "LITELLM_MAX_TOKENS_PER_DOC", DEFAULT_RERANKER_LITELLM_MAX_TOKENS_PER_DOC
-                ),
                 litellm_timeout=_member_float(base, "LITELLM_TIMEOUT", DEFAULT_RERANKER_LITELLM_TIMEOUT),
                 litellm_sdk_api_key=_member_opt_str(base, "LITELLM_SDK_API_KEY"),
                 litellm_sdk_model=_member_str(base, "LITELLM_SDK_MODEL", DEFAULT_RERANKER_LITELLM_SDK_MODEL),
@@ -3061,6 +3082,9 @@ class HindsightConfig:
     # Tri-state override for "can this LLM read images?". None defers to the
     # provider's own answer; True/False overrides it. See ENV_LLM_VISION.
     llm_vision: bool | None = field(default=None, kw_only=True)
+    # Tri-state override for "does the backend honour json_object?". None defers to
+    # the provider's default. See ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE.
+    llm_openai_compatible_json_mode: bool | None = field(default=None, kw_only=True)
 
     # Per-operation sampling temperature. None means the temperature parameter is
     # omitted from the call (for models that reject explicit temperatures). See
@@ -3237,6 +3261,8 @@ class HindsightConfig:
 
     # Reranker
     reranker_provider: str
+    # Provider-agnostic per-candidate token cap; None disables truncation.
+    reranker_max_tokens_per_candidate: int | None
     reranker_send_bank_as_header: bool
     reranker_local_model: str
     reranker_local_force_cpu: bool
@@ -3276,7 +3302,6 @@ class HindsightConfig:
     reranker_litellm_api_base: str
     reranker_litellm_api_key: str | None
     reranker_litellm_model: str
-    reranker_litellm_max_tokens_per_doc: int | None
     reranker_litellm_timeout: float
     reranker_litellm_sdk_api_key: str | None
     reranker_litellm_sdk_model: str
@@ -3512,6 +3537,7 @@ class HindsightConfig:
     db_pool_max_size: int
     db_command_timeout: int
     db_acquire_timeout: int
+    db_pool_slow_acquire_threshold_seconds: float
     db_statement_timeout: int
     db_max_parallel_workers_per_gather: int | None
     db_session_setup_on_acquire: bool
@@ -3827,6 +3853,12 @@ class HindsightConfig:
     }
 
     @property
+    def entity_trgm_probe_threshold(self) -> float:
+        """The pg_trgm threshold the entity probe actually runs at: never below the merge floor,
+        since a candidate under it can never be merged and would only cost work (#5367)."""
+        return max(self.entity_trgm_similarity_threshold, self.entity_merge_min_similarity)
+
+    @property
     def file_conversion_max_batch_size_bytes(self) -> int:
         """Get maximum total batch size in bytes."""
         return self.file_conversion_max_batch_size_mb * 1024 * 1024
@@ -3848,6 +3880,7 @@ class HindsightConfig:
         primary = RerankerMemberConfig(
             index=0,
             provider=self.reranker_provider,
+            max_tokens_per_candidate=self.reranker_max_tokens_per_candidate,
             local_model=self.reranker_local_model,
             local_force_cpu=self.reranker_local_force_cpu,
             local_max_concurrent=self.reranker_local_max_concurrent,
@@ -3883,7 +3916,6 @@ class HindsightConfig:
             litellm_api_base=self.reranker_litellm_api_base,
             litellm_api_key=self.reranker_litellm_api_key,
             litellm_model=self.reranker_litellm_model,
-            litellm_max_tokens_per_doc=self.reranker_litellm_max_tokens_per_doc,
             litellm_timeout=self.reranker_litellm_timeout,
             litellm_sdk_api_key=self.reranker_litellm_sdk_api_key,
             litellm_sdk_model=self.reranker_litellm_sdk_model,
@@ -4248,6 +4280,9 @@ class HindsightConfig:
             llm_send_bank_as_user=os.getenv(ENV_LLM_SEND_BANK_AS_USER, str(DEFAULT_LLM_SEND_BANK_AS_USER)).lower()
             in ("true", "1"),
             llm_vision=_parse_tristate_bool(ENV_LLM_VISION, os.getenv(ENV_LLM_VISION)),
+            llm_openai_compatible_json_mode=_parse_tristate_bool(
+                ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE, os.getenv(ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE)
+            ),
             llm_ollama_num_ctx=_parse_optional_positive_int(
                 ENV_LLM_OLLAMA_NUM_CTX,
                 os.getenv(ENV_LLM_OLLAMA_NUM_CTX),
@@ -4597,6 +4632,13 @@ class HindsightConfig:
             or os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY),
             # Reranker
             reranker_provider=os.getenv(ENV_RERANKER_PROVIDER, DEFAULT_RERANKER_PROVIDER),
+            # Generic name, falling back to the deprecated LiteLLM-specific alias.
+            reranker_max_tokens_per_candidate=int(v)
+            if (
+                v := os.getenv(ENV_RERANKER_MAX_TOKENS_PER_CANDIDATE)
+                or os.getenv(ENV_RERANKER_LITELLM_MAX_TOKENS_PER_DOC)
+            )
+            else DEFAULT_RERANKER_MAX_TOKENS_PER_CANDIDATE,
             reranker_send_bank_as_header=os.getenv(
                 ENV_RERANKER_SEND_BANK_AS_HEADER,
                 str(DEFAULT_RERANKER_SEND_BANK_AS_HEADER),
@@ -4695,9 +4737,6 @@ class HindsightConfig:
             or os.getenv(ENV_LITELLM_API_BASE, DEFAULT_LITELLM_API_BASE),
             reranker_litellm_api_key=os.getenv(ENV_RERANKER_LITELLM_API_KEY) or os.getenv(ENV_LITELLM_API_KEY),
             reranker_litellm_model=os.getenv(ENV_RERANKER_LITELLM_MODEL, DEFAULT_RERANKER_LITELLM_MODEL),
-            reranker_litellm_max_tokens_per_doc=int(v)
-            if (v := os.getenv(ENV_RERANKER_LITELLM_MAX_TOKENS_PER_DOC))
-            else DEFAULT_RERANKER_LITELLM_MAX_TOKENS_PER_DOC,
             reranker_litellm_timeout=float(
                 os.getenv(ENV_RERANKER_LITELLM_TIMEOUT, str(DEFAULT_RERANKER_LITELLM_TIMEOUT))
             ),
@@ -5077,6 +5116,11 @@ class HindsightConfig:
             db_pool_max_size=int(os.getenv(ENV_DB_POOL_MAX_SIZE, str(DEFAULT_DB_POOL_MAX_SIZE))),
             db_command_timeout=int(os.getenv(ENV_DB_COMMAND_TIMEOUT, str(DEFAULT_DB_COMMAND_TIMEOUT))),
             db_acquire_timeout=int(os.getenv(ENV_DB_ACQUIRE_TIMEOUT, str(DEFAULT_DB_ACQUIRE_TIMEOUT))),
+            db_pool_slow_acquire_threshold_seconds=float(
+                os.getenv(
+                    ENV_DB_POOL_SLOW_ACQUIRE_THRESHOLD_SECONDS, str(DEFAULT_DB_POOL_SLOW_ACQUIRE_THRESHOLD_SECONDS)
+                )
+            ),
             db_statement_timeout=int(os.getenv(ENV_DB_STATEMENT_TIMEOUT, str(DEFAULT_DB_STATEMENT_TIMEOUT))),
             db_max_parallel_workers_per_gather=_parse_optional_non_negative_int(
                 ENV_DB_MAX_PARALLEL_WORKERS_PER_GATHER,

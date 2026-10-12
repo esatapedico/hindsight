@@ -41,37 +41,13 @@ from hindsight_api.engine.transfer.schema import (
     TransferObservationSource,
 )
 from hindsight_api.extensions import (
-    OperationValidatorExtension,
-    RecallContext,
-    ReflectContext,
-    RetainContext,
-    RetainResult,
+    BankWriteContext,
+    BankWriteOperation,
+    OperationValidationError,
     ValidationResult,
 )
 from hindsight_api.webhooks.manager import WebhookManager
-
-
-class _RetainResultCapture(OperationValidatorExtension):
-    """Records each RetainResult the engine reports via on_retain_complete.
-
-    The pre-operation validators are required by the abstract base; they always
-    accept so they don't interfere with the operations under test.
-    """
-
-    def __init__(self) -> None:
-        self.results: list[RetainResult] = []
-
-    async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def on_retain_complete(self, result: RetainResult) -> None:
-        self.results.append(result)
+from tests.retain_result_capture import RetainResultCapture
 
 
 async def _seed_observation(*, pool, memory, bank_id, source_memory_ids, observation_text):
@@ -1565,7 +1541,7 @@ async def test_import_fires_retain_complete_hook(memory, request_context):
     await _retain(memory, src, "Bob works at Microsoft.", request_context, "doc-2")
     archive = await memory.export_documents_async(src, request_context)
 
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     original_validator = memory._operation_validator
     memory._operation_validator = capture
     try:
@@ -1587,6 +1563,49 @@ async def test_import_fires_retain_complete_hook(memory, request_context):
             assert res.processed_content_tokens == 0
             # unit_ids are reported per content item, with the created facts.
             assert res.unit_ids and res.unit_ids[0]
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+class _ImportRejectingValidator(RetainResultCapture):
+    """Rejects bank writes to one bank, the way a bank-scoped API key policy would."""
+
+    def __init__(self, forbidden_bank: str) -> None:
+        super().__init__()
+        self.forbidden_bank = forbidden_bank
+        self.writes: list[BankWriteContext] = []
+
+    async def validate_bank_write(self, ctx: BankWriteContext) -> ValidationResult:
+        self.writes.append(ctx)
+        if ctx.bank_id == self.forbidden_bank:
+            return ValidationResult.reject("bank not permitted", status_code=403)
+        return ValidationResult.accept()
+
+
+@pytest.mark.asyncio
+async def test_import_into_existing_bank_runs_bank_write_validator(memory, request_context):
+    """Importing into a bank that already exists goes through validate_bank_write (#5137).
+
+    Before, only a brand-new bank was gated (by validate_create_bank), so a validator
+    scoping keys to banks never saw an import into someone else's existing bank.
+    """
+    src = _unique_bank("transfer_guard_src")
+    dst = _unique_bank("transfer_guard_dst")
+    await _retain(memory, src, "Alice works at Google.", request_context, "doc-1")
+    await _retain(memory, dst, "Bob works at Microsoft.", request_context, "doc-2")
+    archive = await memory.export_documents_async(src, request_context)
+
+    validator = _ImportRejectingValidator(forbidden_bank=dst)
+    original_validator = memory._operation_validator
+    memory._operation_validator = validator
+    try:
+        with pytest.raises(OperationValidationError) as exc:
+            await memory.import_documents_async(dst, archive, request_context)
+        assert exc.value.status_code == 403
+        assert [(w.bank_id, w.operation) for w in validator.writes] == [(dst, BankWriteOperation.IMPORT_DOCUMENTS)]
+        assert validator.results == []
     finally:
         memory._operation_validator = original_validator
         await memory.delete_bank(src, request_context=request_context)

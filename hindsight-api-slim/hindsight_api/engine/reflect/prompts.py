@@ -328,7 +328,9 @@ def build_system_prompt_for_tools(
                     "- Search returns the best match in full and a SNIPPET of the others; call "
                     "read_mental_models on any id whose snippet looks like it answers the question, and read it "
                     "before answering from it",
-                    "- If a relevant mental model exists and is FRESH, it may fully answer the question",
+                    "- A FRESH mental model may fully answer the question — but only if it actually STATES the "
+                    "answer. One that shares the question's topic without stating the answer (e.g. it describes a "
+                    "process, or names the thing without its status) has not answered it: go to the next level",
                     "- Check `is_stale` field - if stale, also verify with lower levels",
                 ],
             )
@@ -349,7 +351,10 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental models/observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_mental_models and search_observations both return 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models and search_observations return 0 results, OR return results that "
+                "do not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms (an issue key, name or "
+                "identifier) verbatim",
                 "- This is the source of truth that other levels are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -360,7 +365,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental model exists, it's stale, or you need specific details",
-                "- MANDATORY: If search_mental_models returns 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models returns 0 results, OR returns a model that does not STATE the "
+                "answer, you MUST call recall() before giving up. Never report that the bank holds nothing about "
+                "something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that mental models are built from",
             ]
         )
@@ -368,7 +375,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up",
+                "- MANDATORY: If search_observations returns 0 results or count=0, OR returns observations that do "
+                "not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that observations are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -440,18 +449,32 @@ def build_system_prompt_for_tools(
         ]
     )
 
-    # Add budget guidance
+    # Add budget guidance. The budget bounds how LONG the answer is and how many
+    # searches get spent on it — never whether the lower retrieval layers are
+    # consulted at all. The earlier low/mid wording ("if mental models or
+    # observations provide a reasonable answer, stop there") did the latter:
+    # combined with the fresh-mental-model short-circuit in agent.py, which stops
+    # forcing the lower layers once a page search returns fresh non-empty pages,
+    # it let a reflect answer "the bank holds nothing about X" off the page layer
+    # while recall() on the same bank returned the facts (#4567). Freshness and
+    # topical overlap are not coverage, so both levels now say to go deeper when
+    # what came back does not answer the question. The absence rule itself is NOT
+    # repeated here: it lives once in the RAW FACTS level above and once on the
+    # ``done`` tool, because every line here is paid for on every reflect (#4716).
     if budget:
         budget_lower = budget.lower()
         if budget_lower == "low":
             parts.extend(
                 [
                     "## RESEARCH DEPTH: SHALLOW (Quick Response)",
-                    "- Prioritize speed over completeness",
-                    "- If mental models or observations provide a reasonable answer, stop there",
-                    "- Only dig deeper if the initial results are clearly insufficient",
-                    "- Prefer a quick overview rather than exhaustive details",
-                    "- Answer promptly with available information",
+                    "- Keep the ANSWER short: a quick overview, not exhaustive detail. Depth is what you cut, "
+                    "not coverage",
+                    "- Spend few searches, but make them count: vary the query instead of repeating one that "
+                    "already ran",
+                    "- A mental model or observation that ANSWERS the question is enough to stop; one that is "
+                    "merely on the same topic is not",
+                    "- If what you found does not cover the question, go on to the next level rather than "
+                    "answering from it",
                     "",
                 ]
             )
@@ -462,6 +485,8 @@ def build_system_prompt_for_tools(
                     "- Balance thoroughness with efficiency",
                     "- Check multiple sources when the question warrants it",
                     "- Verify stale data if it's central to the answer",
+                    "- A result that is merely on the same topic does not answer the question: when it does not "
+                    "cover it, go on to the next level",
                     "- Don't over-explore, but ensure reasonable coverage",
                     "",
                 ]
@@ -487,18 +512,26 @@ def build_system_prompt_for_tools(
         steps.append("First, try search_mental_models() - check if a curated summary exists")
     if include_observations:
         if has_mental_models:
-            steps.append("If no mental model or it's stale, try search_observations() for consolidated knowledge")
+            steps.append(
+                "If there is no mental model, it's stale, OR it does not state the answer, "
+                "try search_observations() for consolidated knowledge"
+            )
         else:
             steps.append("First, try search_observations() - check for consolidated knowledge")
     # Recall step phrasing varies with whichever upstream tool(s) precede it.
     if include_observations:
         steps.append(
-            "If observations are stale OR you need specific details, use recall() for raw facts"
+            "If the levels above are stale, do not state the answer, OR you need specific details, "
+            "use recall() for raw facts. Reporting that nothing is known requires recall() first"
             if has_mental_models
-            else "If search_observations returns 0 results OR observations are stale, you MUST call recall() for raw facts"
+            else "If search_observations returns 0 results, is stale, OR does not state the answer, you MUST call "
+            "recall() for raw facts"
         )
     elif has_mental_models:
-        steps.append("If no mental model or it's stale, use recall() for raw facts")
+        steps.append(
+            "If there is no mental model, it's stale, OR it does not state the answer, use recall() for raw facts. "
+            "Reporting that nothing is known requires recall() first"
+        )
     else:
         steps.append("Call recall() to gather raw facts")
     steps.append("Use expand() if you need more context on specific memories")
@@ -670,14 +703,18 @@ def _cut_entry_to_budget(entry: dict, token_budget: int) -> dict:
         output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         output_str = str(output)
-    tokens = count_prompt_tokens(output_str)
+    cut = {**entry, "output": {"truncated": True, "content": output_str}}
+    # Count the final block, not the raw text: wrapping JSON as a string escapes
+    # quotes and newlines again, and the wrapper and tool heading also take space.
+    tokens = count_prompt_tokens(_render_history_block(cut))
     while output_str and tokens > token_budget:
         # Proportional shrink with a safety margin; the loop guards against the
         # estimate landing high, and always makes progress.
         keep = min(len(output_str) - 1, max(1, int(len(output_str) * token_budget / tokens * 0.95)))
         output_str = output_str[:keep]
-        tokens = count_prompt_tokens(output_str)
-    return {**entry, "output": {"truncated": True, "content": output_str}}
+        cut["output"]["content"] = output_str
+        tokens = count_prompt_tokens(_render_history_block(cut))
+    return cut
 
 
 def split_context_history(context_history: list[dict], max_context_tokens: int) -> list[list[dict]]:
@@ -1105,24 +1142,7 @@ You will be given:
    (1..6) and an ordered list of ``blocks``. Each block has a stable ``id`` and
    a ``text`` field holding one markdown fragment — a paragraph, a list, a
    table, or a fenced code block.
-3. NEW INFORMATION SYNTHESIS (markdown) — UNTRUSTED. Prose written by another
-   model that saw ONLY the supporting facts below. It is a reading aid, not
-   evidence, and it is frequently wrong about what exists: it says things like
-   "no X was found" or "a total of N" when X is merely absent from this batch
-   and N counts only this batch. NEVER edit the document on the strength of a
-   sentence in the synthesis — only the SUPPORTING FACTS justify an operation.
-   A synthesis showing how the new facts
-   relate to the document's topic. Use it to understand context and relevance,
-   but do NOT copy its formatting or wording wholesale.
-   It was written from the SUPPORTING FACTS BELOW AND NOTHING ELSE. It could not
-   see the current document or any earlier fact, so every count, total, list or
-   summary in it describes ONLY the new facts — never the topic as a whole.
-   "A total of 4 customers..." in the synthesis means four in this batch, not
-   four altogether. Such a figure NEVER contradicts a different figure in the
-   document: the document counted what it could see, the synthesis counted what
-   it could see, and the answer is usually the two combined. Likewise the
-   synthesis saying nothing about something is not evidence against it.
-4. SUPPORTING FACTS — observations and facts created since the last refresh.
+3. SUPPORTING FACTS — observations and facts created since the last refresh.
    These are genuinely new — they were NOT available when the current document
    was written.
 
@@ -1162,17 +1182,15 @@ RULES
   SUPPORTING FACTS is NOT thereby wrong, superseded or removed. The facts are one
   batch, not the whole memory — the document was built from facts you cannot see.
   "The batch does not mention X" and "X did not happen" are different statements,
-  and only the second would justify an edit. This applies to the SYNTHESIS too: if
-  it reports that something is absent, unrecorded or not found, that is a
-  statement about the batch, never about the topic.
+  and only the second would justify an edit.
 - **Refutation threshold for removal or overwrite**: you may only remove or
   overwrite existing text when a SUPPORTING FACT explicitly refutes or corrects
   that exact detail, OR is a later-DATED statement about the same facet (a
   status, count, owner or location that has since changed). "Later" is about
   the dates the texts give, never about arrival: facts reach you out of date
   order, and a fact dated before the state the document records is backfilled
-  history — it belongs in the history, not in place of the current state, even
-  when the synthesis calls it current. Failing both tests, keep the
+  history — it belongs in the history, not in place of the current state.
+  Failing both tests, keep the
   existing text: use ``append_block`` / ``insert_block``, or re-emit the block
   with the new detail merged into a cohesive statement that still carries the old
   one. Combining two disjoint sets is a merge, never a replacement.
@@ -1264,7 +1282,7 @@ class FittedDeltaPrompt:
 
     The sections are named for their *slots*, not their contents, because both
     callers reuse this fitter with different material in them: the refresh prompt
-    puts the synthesis in ``candidate`` and the new facts in ``facts``, while the
+    leaves ``candidate`` empty and puts the new facts in ``facts``, while the
     retraction prompt puts the still-supported facts in ``candidate`` and the
     retracted ones in ``facts``.
 
@@ -1298,8 +1316,7 @@ def _fit_structured_delta_prompt_parts(
         f"## Topic\n{source_query}\n\n"
         f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n\n```\n\n"
-        f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
-        f"```markdown\n\n```\n\n"
+        f"## CANDIDATE SLOT (the retraction prompt's still-supported facts)\n\n"
         f"## SUPPORTING FACTS (new since last refresh — integrate these)\n"
         f"{budget_hint}\n\n"
         f"{task_footer}"
@@ -1307,7 +1324,10 @@ def _fit_structured_delta_prompt_parts(
     facts_header = "## SUPPORTING FACTS (new since last refresh — integrate these)\n"
     facts_prefix_tokens = count_prompt_tokens(facts_header)
     reserved_facts = min(4096, max(512, max_input_tokens // 8))
-    doc_budget = max(1024, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 55 // 100)
+    # The refresh prompt leaves the candidate slot empty (its synthesis is not
+    # sent, #5272), so the document gets the candidate's share as well.
+    doc_share = 55 if candidate_markdown else 85
+    doc_budget = max(1024, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * doc_share // 100)
     cand_budget = max(512, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 30 // 100)
     facts_budget = max(256, reserved_facts - facts_prefix_tokens)
     doc_json = _truncate_prompt_text(current_document_json, doc_budget)
@@ -1361,7 +1381,6 @@ def build_mental_model_refresh_context(name: str, *, delta: bool) -> str:
 def build_structured_delta_prompt(
     *,
     current_document_json: str,
-    candidate_markdown: str,
     supporting_facts: list[dict[str, Any]],
     source_query: str,
     max_output_tokens: int | None = None,
@@ -1372,8 +1391,16 @@ def build_structured_delta_prompt(
     """Build the user prompt for a structured-delta mental model refresh.
 
     The LLM's job is to emit operations against ``current_document_json``;
-    the surrounding ``candidate_markdown`` and ``supporting_facts`` are
-    references for *what new information exists*, not templates to mimic.
+    ``supporting_facts`` say *what new information exists*.
+
+    The refresh's own synthesis is deliberately NOT shown. It is written from the
+    new batch alone, so it reports "no release was deployed" or "a total of 4"
+    about the batch, and the ops call kept reading those as statements about the
+    topic: it overwrote a production release recorded one wave earlier. #4304
+    labelled it UNTRUSTED and added absence-is-not-contradiction rules (5/5 then),
+    but gemini-3.1-flash-lite and qwen3.8-flash both overwrote the release again
+    (0/2). Without the synthesis the same eval went 5/5, with the count case
+    unchanged — the facts carry everything an operation may rest on (#5272).
 
     ``max_output_tokens`` is surfaced in the prompt so the model can keep its
     op list within the provider's response cap. The actual cap is enforced by
@@ -1441,7 +1468,7 @@ def build_structured_delta_prompt(
     fitted = _fit_structured_delta_prompt_parts(
         source_query=source_query,
         current_document_json=current_document_json,
-        candidate_markdown=candidate_markdown,
+        candidate_markdown="",
         facts_block=facts_block,
         budget_hint=budget_hint,
         task_footer=task_footer,
@@ -1450,7 +1477,7 @@ def build_structured_delta_prompt(
     truncation_note = ""
     if fitted.truncated:
         truncation_note = (
-            "\n\n*Note: Document, synthesis, or facts were truncated to fit the model "
+            "\n\n*Note: Document or facts were truncated to fit the model "
             "context window. Prefer minimal, high-leverage operations.*"
         )
 
@@ -1458,8 +1485,6 @@ def build_structured_delta_prompt(
         f"## Topic\n{source_query}\n\n"
         f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n{fitted.document_json}\n```\n\n"
-        f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
-        f"```markdown\n{fitted.candidate}\n```\n\n"
         f"## SUPPORTING FACTS (new since last refresh — integrate these)\n{fitted.facts}"
         f"{document_hint}{budget_hint}{truncation_note}\n\n"
         f"{task_footer}"

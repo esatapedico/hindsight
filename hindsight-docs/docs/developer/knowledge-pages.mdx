@@ -2,8 +2,8 @@
 sidebar_position: 7
 ---
 
-import {Flow} from '@vectorize-io/interfig';
-import knowledgePagesFigure from '@vectorize-io/interfig/figures/knowledge-pages';
+import Figure from '@site/src/components/Figure';
+import knowledgePagesFigure from '@site/figures/knowledge-pages.json';
 
 # Knowledge Pages
 
@@ -11,7 +11,7 @@ import knowledgePagesFigure from '@vectorize-io/interfig/figures/knowledge-pages
 
 The shape is a wiki. The engine underneath is memory.
 
-<Flow {...knowledgePagesFigure.props} />
+<Figure doc={knowledgePagesFigure} />
 
 ---
 
@@ -81,4 +81,4 @@ This is also why pages heal themselves rather than rot: they aren't the storage,
 - **Control plane** — the Knowledge Base view renders the tree, page contents, and which pages have fallen behind.
 - **HTTP API** — see [Knowledge Pages API](./api/knowledge-pages) for the full endpoint surface.
 - **CLI** — `hindsight fs` mirrors a bank to a local folder of markdown files.
-- **Agent tools** — the agent SDK exposes `agent_knowledge_*` tools so an agent can list, read, create, and update its own pages during a session.
+- **Agent tools** — the Claude Code plugin exposes `agent_knowledge_*` MCP tools so an agent can list, read, create, and update its own pages during a session.

@@ -282,7 +282,6 @@ def _parse_tag_groups_query(raw: str | None, tags: list[str] | None) -> list[Tag
 
 from hindsight_api.engine.structured_output import validate_response_schema
 from hindsight_api.engine.time_filter import DocumentTimeField, MemoryTimeField
-from hindsight_api.engine.token_encoding import count_tokens
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
 from hindsight_api.liveness import LivenessResponse, liveness_response
 from hindsight_api.metrics import (
@@ -400,6 +399,55 @@ async def run_cancellable_on_disconnect(
     except OperationCancelledError as e:
         logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
         raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
+
+
+async def run_task_cancellable_on_disconnect(
+    http_request: Request,
+    coro: Awaitable[_T],
+    *,
+    operation: str,
+    bank_id: str,
+) -> _T:
+    """Run a coroutine as a task and cancel it outright if the client disconnects.
+
+    The cooperative variant above is the right shape for recall and reflect, whose
+    expensive stages run in worker threads that task cancellation cannot interrupt.
+    A synchronous retain is the opposite shape: almost all of its wall time is spent
+    *awaiting* — queued on the LLM concurrency semaphore, then on the provider's
+    response — so a checkpoint between stages never gets a turn, and only real task
+    cancellation unblocks it. An abandoned sync retain measured 1880s, holding an LLM
+    slot the whole way and committing into a bank that had been deleted meanwhile
+    (issue #4526).
+
+    Cancelling retain mid-flight is a path the pipeline already handles: the worker
+    runs every retain under an absolute ``asyncio.timeout`` ceiling, and the
+    orchestrator's ``finally`` blocks commit what earlier sub-batches produced and
+    stop the in-flight extraction tasks.
+    """
+    token = get_scope_cancellation_token(http_request.scope)
+    if token is None:
+        return await coro
+    task = asyncio.ensure_future(coro)
+    waiter = asyncio.ensure_future(token.wait())
+    try:
+        done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return task.result()
+        task.cancel()
+        # Awaited, not abandoned: the unwinding task still commits partial work and
+        # tears down its own subtasks, and anything it raises on the way out is the
+        # cancellation, not a fault worth reporting over the 499.
+        await asyncio.gather(task, return_exceptions=True)
+        logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={token.reason}")
+        raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=token.reason)
+    finally:
+        waiter.cancel()
+        # This call can itself be cancelled from above (server shutdown, a deadline),
+        # and `asyncio.wait` does not propagate that to what it was waiting on —
+        # leaving the retain running with nobody to answer, the very thing this
+        # helper exists to stop. Already done on the disconnect path above.
+        if not task.done():
+            task.cancel()
 
 
 class EntityIncludeOptions(BaseModel):
@@ -4222,7 +4270,7 @@ async def apply_bank_template_manifest(
             provisioned = await memory.list_mental_models(
                 bank_id=bank_id,
                 limit=None,
-                detail="metadata",
+                detail="config",
                 request_context=request_context,
             )
             existing_by_id = {item["id"]: item for item in provisioned.items}
@@ -4283,7 +4331,7 @@ async def apply_default_bank_template_resources(
     existing_by_id: dict[str, dict[str, Any]] = {}
     if manifest.mental_models:
         existing = await memory.list_mental_models(
-            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+            bank_id=bank_id, limit=None, detail="config", request_context=request_context
         )
         existing_by_id = {model["id"]: model for model in existing.items}
 
@@ -4308,6 +4356,37 @@ async def apply_default_bank_template_resources(
     )
 
 
+def _mental_model_matches_template(stored: dict[str, Any], mm: "BankTemplateMentalModel") -> bool:
+    """True when re-applying ``mm`` would leave the stored model as it is.
+
+    Mirrors what the update writes: empty manifest tags leave the stored tags
+    alone, so they never count as a difference. The stored trigger goes through
+    ``MentalModelTrigger`` so its unset fields get the same defaults as the
+    manifest's; one that no longer parses counts as changed.
+    """
+    try:
+        stored_trigger = MentalModelTrigger.model_validate(stored["trigger"] or {})
+    except ValidationError:
+        return False
+    return (
+        stored["name"] == mm.name
+        and stored["source_query"] == mm.source_query
+        and stored["max_tokens"] == mm.max_tokens
+        and (not mm.tags or set(stored["tags"]) == set(mm.tags))
+        and stored_trigger == mm.trigger
+    )
+
+
+def _directive_matches_template(stored: dict[str, Any], directive: "BankTemplateDirective") -> bool:
+    """True when re-applying ``directive`` would leave the stored one as it is."""
+    return (
+        stored["content"] == directive.content
+        and stored["priority"] == directive.priority
+        and stored["is_active"] == directive.is_active
+        and (not directive.tags or set(stored["tags"]) == set(directive.tags))
+    )
+
+
 async def _apply_bank_template_resources(
     memory: MemoryEngine,
     bank_id: str,
@@ -4326,6 +4405,10 @@ async def _apply_bank_template_resources(
     if manifest.mental_models:
         for mm in manifest.mental_models:
             if mm.id in existing_mental_models:
+                # Unchanged: skip it, or every re-apply of the same manifest would
+                # regenerate the model with an LLM call for nothing (#5271).
+                if _mental_model_matches_template(existing_mental_models[mm.id], mm):
+                    continue
                 await memory.update_mental_model(
                     bank_id=bank_id,
                     mental_model_id=mm.id,
@@ -4369,6 +4452,8 @@ async def _apply_bank_template_resources(
     if manifest.directives:
         for directive in manifest.directives:
             if directive.name in existing_directives:
+                if _directive_matches_template(existing_directives[directive.name], directive):
+                    continue
                 await memory.update_directive(
                     bank_id=bank_id,
                     directive_id=existing_directives[directive.name]["id"],
@@ -5416,9 +5501,11 @@ def _register_routes(app: FastAPI):
             if controller is None:
                 yield
                 return
-            # Recall and reflect carry a disconnect token (see api/disconnect.py). A
-            # queued request whose client has gone gives up its place immediately,
-            # which is what makes a patient deadline affordable.
+            # Recall, reflect and the retain POST carry a disconnect token (see
+            # api/disconnect.py). A queued request whose client has gone gives up its
+            # place immediately, which is what makes a patient deadline affordable.
+            # Retain joined them in #4526: before that its lane kept the place of a
+            # caller that had already hung up, because this returned None for it.
             abandoned = get_scope_cancellation_token(request.scope)
             try:
                 async with controller.admit(str(operation), abandoned=abandoned):
@@ -6086,16 +6173,6 @@ def _register_routes(app: FastAPI):
                 metrics.record_recall_phase("deps_total", max(0.0, _deps_done - _deps_t0))
             if _deps_done:
                 metrics.record_recall_phase("body_parse", max(0.0, handler_start - _deps_done))
-
-        # Validate query length to prevent expensive operations on oversized queries
-        max_query_tokens = get_config().recall_max_query_tokens
-        if max_query_tokens > 0:  # 0 (or negative) disables the cap
-            query_tokens = count_tokens(request.query)
-            if query_tokens > max_query_tokens:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
-                )
 
         try:
             # Default to all fact types if not specified
@@ -8704,6 +8781,9 @@ def _register_routes(app: FastAPI):
             profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
             if profile is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+            # The template carries the bank's whole config: an admin export, not narrowed
+            # to a tag scope, so scoped callers are refused like the full bank export.
+            await app.state.memory._refuse_bank_wide_if_scoped(bank_id, request_context, "export the bank template")
 
             # Get bank-specific config overrides (not the fully resolved config,
             # so the template only contains what was explicitly set on this bank)
@@ -9959,6 +10039,7 @@ def _register_routes(app: FastAPI):
     async def api_retain(
         bank_id: str,
         request: RetainRequest,
+        http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
         _admit: None = Depends(admit_for(PrecheckOperation.RETAIN)),
@@ -10127,9 +10208,14 @@ def _register_routes(app: FastAPI):
                 # Synchronous processing: one batch per strategy group, aggregate results
                 total_items_count = 0
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
-                with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+
+                # A coroutine rather than an inline loop so the whole thing can be run
+                # as one cancellable task below; the totals stay in the enclosing scope
+                # because the response is built from them.
+                async def _retain_groups() -> None:
+                    nonlocal total_items_count, total_usage
                     for group_strategy, contents in strategy_groups.items():
-                        result, usage = await app.state.memory.retain_batch_async(
+                        _, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
                             contents=contents,
                             document_tags=request.document_tags,
@@ -10150,6 +10236,19 @@ def _register_routes(app: FastAPI):
                                 output_tokens=total_usage.output_tokens + usage.output_tokens,
                                 total_tokens=total_usage.total_tokens + usage.total_tokens,
                             )
+
+                with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+                    # A sync retain has no operation row and no ack, so nothing else can
+                    # stop it once it starts: without this an abandoned one runs to
+                    # completion, holding an LLM slot and committing work nobody will
+                    # read (issue #4526). The async path is unaffected — it returns
+                    # before any extraction runs, and DELETE /operations/{id} stops it.
+                    await run_task_cancellable_on_disconnect(
+                        http_request,
+                        _retain_groups(),
+                        operation="retain",
+                        bank_id=bank_id,
+                    )
 
                 return RetainResponse.model_validate(
                     {

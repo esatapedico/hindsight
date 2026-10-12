@@ -1,5 +1,6 @@
 ---
 title: "Give the Only Self-Improving AI Agent (Hermes) a Memory Upgrade It Deserves"
+description: "Swap Hermes Agent's file-based memory for Hindsight with one pip install. This plugin is now deprecated in favour of the Hermes plugin catalog."
 authors: [benfrank241]
 date: 2026-03-17T12:00
 tags: [hermes, agents, python, memory, tutorial, plugin]
@@ -9,7 +10,7 @@ image: /img/blog/hermes-agent-memory.png
 ![How to Add Persistent Memory to Hermes Agent](/img/blog/hermes-agent-memory.png)
 
 :::warning Deprecated
-The `hindsight-hermes` pip plugin described in this post is deprecated. Hermes now ships with a native Hindsight memory provider. See [Hindsight Is Now a Native Memory Provider in Hermes Agent](/blog/2026/04/06/hermes-native-memory-provider) for the current setup guide.
+The `hindsight-hermes` pip plugin described in this post is deprecated. Hindsight is now a Hermes memory provider installed from the Hermes plugin catalog: `hermes plugins install hindsight`, then `hermes memory setup`. See [What Changes Now That Hindsight Is a Hermes Plugin](/blog/2026/10/01/hindsight-hermes-plugin-what-changed) for the current setup guide.
 :::
 
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) is a self-improving AI agent with 40+ tools and a plugin system. Its built-in memory saves to local files. `hindsight-hermes` replaces it with structured fact extraction, entity resolution, and multi-strategy retrieval — via one pip install and three environment variables.

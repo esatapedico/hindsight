@@ -318,7 +318,7 @@ def _summarize_provider_error_payload(error: Any, max_len: int = 400) -> str:
 # and gateways this provider fronts. Losing the repair there is the cheaper mistake:
 # a JSONDecodeError is loud and the caller can split, while a silently short answer
 # is indistinguishable from a complete one. Same reasoning as #3827.
-_COMPLETED_FINISH_REASONS = frozenset({"stop", "tool_calls", "function_call", "end_turn"})
+COMPLETED_FINISH_REASONS = frozenset({"stop", "tool_calls", "function_call", "end_turn"})
 
 
 def _finish_reason_for_choice(choice: Any) -> Any:
@@ -360,6 +360,11 @@ def _first_choice_or_error(response: Any, *, provider: str, model: str, scope: s
             retryable=True,
         )
     return choices[0]
+
+
+def _is_openrouter(provider: str, base_url: str | None) -> bool:
+    """True for the openrouter provider and for openai pointed at an OpenRouter base URL."""
+    return provider == "openrouter" or urlparse(base_url or "").hostname == "openrouter.ai"
 
 
 def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -> tuple[str, Any]:
@@ -586,6 +591,19 @@ def _asks_for_reasoning_effort_none(e: APIStatusError) -> bool:
     # The remedy lives in the response body, not in the exception's own message.
     message = _summarize_status_error(e, body_max=1000)
     return "reasoning_effort" in message and "'none'" in message
+
+
+def _rejects_tool_choice(e: APIStatusError) -> bool:
+    """Whether the endpoint refused the request because of its ``tool_choice``.
+
+    The static lists above cover endpoints that always refuse a forced choice. Some
+    refuse it only in one mode, so no model name can tell: Alibaba's Qwen 3.8 host
+    (direct or through OpenRouter) answers "The tool_choice parameter does not
+    support being set to required or object in thinking mode", while vLLM and Groq
+    serve the same weights and accept it. Reflect forces its first retrieval call,
+    so without this every reflect against that host failed on its first request.
+    """
+    return e.status_code == 400 and "tool_choice" in _summarize_status_error(e, body_max=1000)
 
 
 def _parse_go_duration_seconds(text: str) -> float | None:
@@ -1276,15 +1294,18 @@ class OpenAICompatibleLLM(LLMInterface):
                         first_msg = call_params["messages"][0]
                         if isinstance(first_msg, dict) and isinstance(first_msg.get("content"), str):
                             first_msg["content"] = schema_msg + "\n\n" + first_msg["content"]
-                # Providers that skip json_object grammar enforcement
-                skip_grammar = self.provider in ("lmstudio", "ollama", "volcano")
-                if self.provider == "llamacpp":
-                    from hindsight_api.config import get_config
-
-                    skip_grammar = get_config().llamacpp_no_grammar
-                if not skip_grammar:
+                if self._supports_json_mode():
                     call_params["messages"] = _ensure_json_word_in_user_message(call_params["messages"])
                     call_params["response_format"] = {"type": "json_object"}
+
+        # OpenRouter load-balances one model across upstreams, and an upstream that
+        # does not support response_format may answer with empty content and
+        # finish_reason=stop instead of an error (#3494). require_parameters limits
+        # routing to upstreams that honour every parameter sent. Operator-set
+        # provider routing keys win; the provider dict is copied, not mutated.
+        if "response_format" in call_params and _is_openrouter(self.provider, self.base_url):
+            body = call_params.setdefault("extra_body", {})
+            body["provider"] = {"require_parameters": True, **body.get("provider", {})}
 
         apply_bank_attribution(call_params)
         # Cache pinning, alongside the other identity injection above and, like
@@ -1371,7 +1392,7 @@ class OpenAICompatibleLLM(LLMInterface):
                             # a provider that omits finish_reason would have a
                             # truncated body repaired into schema-valid partial
                             # data.
-                            if _finish_reason_for_choice(first_choice) not in _COMPLETED_FINISH_REASONS:
+                            if _finish_reason_for_choice(first_choice) not in COMPLETED_FINISH_REASONS:
                                 logger.error(
                                     f"JSON parse error after {attempt + 1} attempts and no "
                                     f"completion signal (finish_reason="
@@ -1852,6 +1873,17 @@ class OpenAICompatibleLLM(LLMInterface):
                     call_params["reasoning_effort"] = "none"
                     attempts_allowed += 1
                     continue
+                if "tool_choice" in call_params and _rejects_tool_choice(e):
+                    # Same downgrade as the static Meta/Z.AI branch above: a named
+                    # choice was already narrowed to its one tool, so "auto" keeps
+                    # the call practically forced.
+                    logger.warning(
+                        f"{self.provider}/{self.model} rejected tool_choice={call_params['tool_choice']!r}; "
+                        f"retrying with auto (scope={scope}): {_summarize_status_error(e)}"
+                    )
+                    del call_params["tool_choice"]
+                    attempts_allowed += 1
+                    continue
 
                 if attempt + 1 < attempts_allowed:
                     logger.warning(
@@ -2039,7 +2071,7 @@ class OpenAICompatibleLLM(LLMInterface):
                             # OpenAI-compatible path above, gated the same
                             # way: only a generation that reported reaching
                             # its own end gets structurally repaired.
-                            if result.get("done_reason") not in _COMPLETED_FINISH_REASONS:
+                            if result.get("done_reason") not in COMPLETED_FINISH_REASONS:
                                 logger.error(
                                     f"Ollama JSON parse error after {attempt + 1} attempts and no "
                                     f"completion signal (done_reason={result.get('done_reason')!r}); "
@@ -2149,6 +2181,18 @@ class OpenAICompatibleLLM(LLMInterface):
         if last_exception:
             raise last_exception
         raise RuntimeError("Ollama call failed after all retries")
+
+    def _supports_json_mode(self) -> bool:
+        """Whether to send ``json_object`` on the soft path, or the schema in the prompt only."""
+        from hindsight_api.config import get_config
+
+        config = get_config()
+        if config.llm_openai_compatible_json_mode is not None:
+            return config.llm_openai_compatible_json_mode
+        if self.provider == "llamacpp":
+            return not config.llamacpp_no_grammar
+        # These don't honour json_object reliably.
+        return self.provider not in ("lmstudio", "ollama", "volcano")
 
     def supports_vision(self) -> bool | None:
         """Known only for OpenAI itself; unknown for every other backend here.

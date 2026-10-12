@@ -10,7 +10,9 @@
 
 <HomeBenchmarks />
 
-<HomeCodingAgents />
+{/* Retrieval accuracy only. The coding-agent chart opens inside the coding-agents
+    card above, where it is evidence for a path the reader has just been shown,
+    and is explained in full on /sdks/integrations/coding-agents. */}
 
 ## Why Hindsight?
 
@@ -33,14 +35,12 @@ Hindsight solves these problems with a memory system designed specifically for A
 
 ## How It Works
 
-{/* The one-glance version. The interactive figure further down explains the
-    pipeline; this answers the question that comes before it — how does my
-    agent, or my app, actually talk to this. */}
+{/* The router: three kinds of visitor land on this page — one who has never
+    heard of agent memory, one looking for the coding-agent plugin, one looking
+    for the Hermes/OpenClaw plugin — and this is where each of them can see
+    their own path. It opens "How It Works" because the cards answer "what does
+    this look like for me" before the sections below answer "how". */}
 <HomeFlow />
-
-{/* Both charts in one place: retrieval accuracy and what memory does to a
-    coding agent are the same question asked twice, and splitting them across
-    the page made neither land. */}
 
 ### Memory Types
 
@@ -57,7 +57,7 @@ facts and then builds on them:
 Facts are not a list. Each is linked to the entities it mentions and to the other
 facts that share them, which is what makes "where does Alice work?" answerable
 from two facts that were never stored together — the graph at the top of this
-page is one bank's.
+page is a sample bank's; hover a memory to see what it links to.
 
 ### Multi-Strategy Retrieval
 
@@ -154,7 +154,18 @@ behind them. Play it, or step through it at your own pace.
 
 ## Integrations
 
-Browse all supported integrations in the Integrations Hub.
+**Coding agents** — [one install](../sdks/integrations/coding-agents.md) wires 20+
+harnesses (Claude Code, Codex CLI, Cursor CLI, opencode, Copilot CLI and more) to
+a per-repo memory bank.
+
+**Personal agents** — [Hermes](../sdks/integrations/hermes.md) and
+[OpenClaw](../sdks/integrations/openclaw.md) install Hindsight as their memory
+provider: every turn recalls what matters before answering and retains what was
+said afterwards. The Hermes desktop app configures it
+[in Settings](../sdks/integrations/hermes-desktop.md), no terminal.
+
+Everything else — frameworks, MCP servers, tools — is in the
+Integrations Hub.
 
 ## Next Steps
 

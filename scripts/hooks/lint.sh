@@ -44,7 +44,6 @@ echo "  Running lints in parallel..."
 run_task "eslint" "$REPO_ROOT/hindsight-control-plane" "npx eslint --fix src/**/*.{ts,tsx}"
 run_task "prettier" "$REPO_ROOT/hindsight-control-plane" "npx prettier --write src/**/*.{ts,tsx}"
 run_task "prettier-ts-client" "$REPO_ROOT/hindsight-clients/typescript" "npx --yes prettier --write --config $REPO_ROOT/.prettierrc.json --ignore-path $REPO_ROOT/.gitignore ."
-run_task "prettier-interfig" "$REPO_ROOT/hindsight-interfig" "npx prettier --write ."
 run_task "prettier-all-npm" "$REPO_ROOT/hindsight-all-npm" "npx --yes prettier --write --config $REPO_ROOT/.prettierrc.json --ignore-path $REPO_ROOT/.gitignore ."
 
 # Python hindsight-api-slim tasks
@@ -90,29 +89,6 @@ if [ -d "$INTEGRATIONS_DIR" ] && { [ "$LINT_ALL" = "1" ] || [ -n "$CHANGED_FILES
             run_task "ruff-int-$name-format" "$dir" "uv run --no-project ruff format --config $REPO_ROOT/ruff.toml ."
         elif [ -f "$dir/package.json" ]; then
             run_task "prettier-int-$name" "$dir" "npx --yes prettier --write --config $REPO_ROOT/.prettierrc.json --ignore-path $REPO_ROOT/.gitignore ."
-        fi
-    done
-fi
-
-# Hindsight tools (Node packages under hindsight-tools/)
-TOOLS_DIR="$REPO_ROOT/hindsight-tools"
-if [ -n "$CI" ] || [ -n "$LINT_ALL_INTEGRATIONS" ]; then
-    LINT_TOOLS_ALL=1
-    TOOLS_CHANGED=""
-else
-    LINT_TOOLS_ALL=0
-    TOOLS_CHANGED=$( { git -C "$REPO_ROOT" diff --name-only HEAD -- "hindsight-tools/"; \
-                       git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "hindsight-tools/"; } | sort -u )
-fi
-
-if [ -d "$TOOLS_DIR" ] && { [ "$LINT_TOOLS_ALL" = "1" ] || [ -n "$TOOLS_CHANGED" ]; }; then
-    for dir in "$TOOLS_DIR"/*/; do
-        name=$(basename "$dir")
-        if [ "$LINT_TOOLS_ALL" != "1" ]; then
-            echo "$TOOLS_CHANGED" | grep -q "^hindsight-tools/$name/" || continue
-        fi
-        if [ -f "$dir/package.json" ]; then
-            run_task "prettier-tool-$name" "$dir" "npx --yes prettier --write --config $REPO_ROOT/.prettierrc.json --ignore-path $REPO_ROOT/.gitignore ."
         fi
     done
 fi
