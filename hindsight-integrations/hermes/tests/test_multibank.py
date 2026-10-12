@@ -563,7 +563,14 @@ def test_single_bank_recall_returns_the_server_response_unchanged():
 
 
 def _not_found() -> Exception:
-    from hindsight_client_api.exceptions import NotFoundException
+    try:
+        from hindsight_client_api.exceptions import NotFoundException
+    except ModuleNotFoundError:  # SDK not installed on this host; the plugin only reads .status
+        class NotFoundException(Exception):  # type: ignore[no-redef]
+            def __init__(self, status=None, reason=None):
+                super().__init__(reason)
+                self.status = status
+                self.reason = reason
 
     return NotFoundException(status=404, reason="Not Found")
 
