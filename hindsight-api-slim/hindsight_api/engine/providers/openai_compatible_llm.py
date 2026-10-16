@@ -1332,7 +1332,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         # on every byte, so an upstream trickling keep-alive whitespace never trips it
                         # and the call pins its worker slot forever (#4763).
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     # Stash usage before parse/validate, which may raise locally
                     # even though the provider charged for these tokens (#2387).
@@ -1414,7 +1414,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     async with attempt_context() if attempt_context is not None else nullcontext():
                         set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     stash_response_usage(_usage_from_openai_response(response))
                     result, first_choice = _content_or_error(
@@ -1560,6 +1560,25 @@ class OpenAICompatibleLLM(LLMInterface):
                                         output_tokens=0,
                                         success=True,
                                     )
+                                    # A recovered call is a successful one: the wrapper
+                                    # will not trace it, so record the span here (#5381).
+                                    try:
+                                        from hindsight_api.tracing import _serialize_for_span, get_span_recorder
+
+                                        get_span_recorder().record_llm_call(
+                                            provider=self.provider,
+                                            model=self.model,
+                                            scope=scope,
+                                            messages=messages,
+                                            response_content=_serialize_for_span(result),
+                                            input_tokens=0,
+                                            output_tokens=0,
+                                            duration=duration,
+                                            finish_reason=None,
+                                            error=None,
+                                        )
+                                    except Exception:
+                                        logger.debug("Span recording failed", exc_info=True)
                                     return LLMCallResult(
                                         content=result,
                                         usage=TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0),
@@ -1747,7 +1766,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{attempts_allowed}")
                     response = await asyncio.wait_for(
-                        self._client.chat.completions.create(**call_params), timeout=self.timeout
+                        self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                     )
                     stash_response_usage(_usage_from_openai_response(response))
 
@@ -2191,8 +2210,11 @@ class OpenAICompatibleLLM(LLMInterface):
             return config.llm_openai_compatible_json_mode
         if self.provider == "llamacpp":
             return not config.llamacpp_no_grammar
-        # These don't honour json_object reliably.
-        return self.provider not in ("lmstudio", "ollama", "volcano")
+        # These don't honour json_object reliably. z.ai is worse than unreliable:
+        # in json_object mode it deletes the literal token "json" from the
+        # generated text, so `fleet --json` is stored as `fleet --` and
+        # `latest.json` as `latest.` — still valid JSON, silently corrupted (#5175).
+        return self.provider not in ("lmstudio", "ollama", "volcano", "zai")
 
     def supports_vision(self) -> bool | None:
         """Known only for OpenAI itself; unknown for every other backend here.
@@ -2350,6 +2372,17 @@ class OpenAICompatibleLLM(LLMInterface):
             await self._client.close()
         if hasattr(self, "_ollama_http"):
             await self._ollama_http.close()
+
+    def supports_request_overrides(self) -> bool:
+        # Ollama's structured/num_ctx calls take a native HTTP path outside the SDK client.
+        return self.provider != "ollama"
+
+    def _request_client(self) -> Any:
+        """The SDK client for one call, with the credentials an LLM request extension chose."""
+        # Lazy: importing the extensions package here would be circular.
+        from hindsight_api.extensions.llm_request import request_client
+
+        return request_client(self._client)
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

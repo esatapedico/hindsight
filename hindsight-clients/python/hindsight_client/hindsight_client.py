@@ -277,10 +277,11 @@ class Hindsight:
             base_url: The base URL of the Hindsight API server
             api_key: Optional API key for authentication (sent as Bearer token)
             timeout: Request timeout in seconds (default: 300.0)
-            user_agent: Override the default ``User-Agent`` header. Integrations
-                should set this to identify themselves (e.g.
-                ``"hindsight-crewai/1.2.0"``). Defaults to
-                ``hindsight-client-python/<version>``.
+            user_agent: Product token placed in front of the client's own in the
+                ``User-Agent`` header. Integrations should set this to identify
+                themselves (e.g. ``"hindsight-crewai/1.2.0"`` is sent as
+                ``"hindsight-crewai/1.2.0 hindsight-client-python/<version>"``).
+                Defaults to ``hindsight-client-python/<version>`` alone.
             max_attempts: Total attempts for *idempotent* calls (recall, reflect)
                 when the server reports it is at capacity (429/503). 1 disables
                 retrying. Waits honour ``Retry-After`` and are jittered; writes are
@@ -291,7 +292,9 @@ class Hindsight:
         base_url = base_url.rstrip("/")
         config = hindsight_client_api.Configuration(host=base_url, access_token=api_key)
         self._api_client = hindsight_client_api.ApiClient(config)
-        self._api_client.user_agent = user_agent or DEFAULT_USER_AGENT
+        # Prefix rather than replace, so the server still learns the client version behind an
+        # integration. Before, a caller's value replaced the default and the version was lost.
+        self._api_client.user_agent = f"{user_agent} {DEFAULT_USER_AGENT}" if user_agent else DEFAULT_USER_AGENT
         self._timeout = timeout
         self._max_attempts = max(1, max_attempts)
         # Per-client RNG so jitter is injectable in tests and independent of any
@@ -646,7 +649,7 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool | None = None,
         min_scores: dict[str, float] | None = None,
         temporal_window: dict[str, Any] | None = None,
     ) -> RecallResponse:
@@ -675,8 +678,9 @@ class Hindsight:
             tag_groups: Optional list of tag group filters for advanced boolean tag matching.
             prefer_observations: When recalling raw facts ("world"/"experience") together with
                 "observation", drop any raw fact a returned observation was consolidated from, so the
-                observation supersedes it (no duplicate content). Disabled by default; no effect unless
-                "observation" and at least one raw type are both in ``types``.
+                observation supersedes it (no duplicate content). No effect unless "observation" and at
+                least one raw type are both in ``types``. ``None`` (default) uses the bank's
+                ``recall_prefer_observations`` config.
             min_scores: Optional per-stage score floors, e.g. ``{"semantic": 0.2, "final": 0.5}``.
                 ``semantic`` and ``keyword`` are retrieval-level cutoffs; ``reranker`` and ``final``
                 are applied to the scored results after reranking. Any omitted stage imposes no floor.
@@ -1322,7 +1326,7 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool | None = None,
         min_scores: dict[str, float] | None = None,
         temporal_window: dict[str, Any] | None = None,
     ) -> RecallResponse:
@@ -1356,8 +1360,9 @@ class Hindsight:
 
             prefer_observations: When recalling raw facts ("world"/"experience") together with
                 "observation", drop any raw fact a returned observation was consolidated from, so the
-                observation supersedes it (no duplicate content). Disabled by default; no effect unless
-                "observation" and at least one raw type are both in ``types``.
+                observation supersedes it (no duplicate content). No effect unless "observation" and at
+                least one raw type are both in ``types``. ``None`` (default) uses the bank's
+                ``recall_prefer_observations`` config.
             min_scores: Optional per-stage score floors, e.g. ``{"semantic": 0.2, "final": 0.5}``.
                 ``semantic`` and ``keyword`` are retrieval-level cutoffs; ``reranker`` and ``final``
                 are applied to the scored results after reranking. Any omitted stage imposes no floor.
@@ -2563,16 +2568,29 @@ class Hindsight:
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
+        timeout_message = f"Export operation {operation_id} did not complete within {timeout}s"
         while True:
-            status = await self._operations_api.get_operation_status(
-                bank_id, operation_id, _request_timeout=self._timeout
-            )
+            # The deadline bounds the in-flight status request and the sleep
+            # too, so a slow poll or a long poll_interval can't overrun it.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(timeout_message)
+            try:
+                status = await asyncio.wait_for(
+                    self._operations_api.get_operation_status(bank_id, operation_id, _request_timeout=self._timeout),
+                    remaining,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(timeout_message) from None
             if status.status == "completed":
                 break
             if status.status in ("failed", "cancelled"):
                 raise RuntimeError(f"Export operation {operation_id} {status.status}: {status.error_message}")
-            if loop.time() >= deadline:
-                raise TimeoutError(f"Export operation {operation_id} did not complete within {timeout}s")
+            # Sleeping out a budget that can't fit another poll just burns the
+            # remainder, and on a coarse clock (Windows wakes up to ~16ms early)
+            # it can leave enough slack for a second poll the caller didn't ask for.
+            if deadline - loop.time() <= poll_interval:
+                raise TimeoutError(timeout_message)
             await asyncio.sleep(poll_interval)
 
         meta = status.result_metadata or {}
@@ -2892,6 +2910,7 @@ class Hindsight:
         # Recall settings
         recall_max_tokens: int | None = None,
         recall_include_chunks: bool | None = None,
+        recall_prefer_observations: bool | None = None,
         recall_chunks_max_tokens: int | None = None,
         recall_budget_function: str | None = None,
         recall_budget_fixed_low: int | None = None,
@@ -2956,6 +2975,7 @@ class Hindsight:
                 consolidation_source_facts_max_tokens_per_observation=consolidation_source_facts_max_tokens_per_observation,
                 recall_max_tokens=recall_max_tokens,
                 recall_include_chunks=recall_include_chunks,
+                recall_prefer_observations=recall_prefer_observations,
                 recall_chunks_max_tokens=recall_chunks_max_tokens,
                 recall_budget_function=recall_budget_function,
                 recall_budget_fixed_low=recall_budget_fixed_low,
@@ -3019,6 +3039,7 @@ class Hindsight:
         # Recall settings
         recall_max_tokens: int | None = None,
         recall_include_chunks: bool | None = None,
+        recall_prefer_observations: bool | None = None,
         recall_chunks_max_tokens: int | None = None,
         recall_budget_function: str | None = None,
         recall_budget_fixed_low: int | None = None,
@@ -3099,6 +3120,7 @@ class Hindsight:
                 individual observation in the consolidation prompt.
             recall_max_tokens: Token budget for facts returned by recall.
             recall_include_chunks: Include source chunks in recall results.
+            recall_prefer_observations: Default ``prefer_observations`` for recall requests that omit it.
             recall_chunks_max_tokens: Token budget for those chunks.
             recall_budget_function: How the per-query result budget is derived: 'fixed' or 'adaptive'.
             recall_budget_fixed_low: Fixed budget for low-breadth queries.
@@ -3158,6 +3180,7 @@ class Hindsight:
                 "consolidation_source_facts_max_tokens_per_observation": consolidation_source_facts_max_tokens_per_observation,
                 "recall_max_tokens": recall_max_tokens,
                 "recall_include_chunks": recall_include_chunks,
+                "recall_prefer_observations": recall_prefer_observations,
                 "recall_chunks_max_tokens": recall_chunks_max_tokens,
                 "recall_budget_function": recall_budget_function,
                 "recall_budget_fixed_low": recall_budget_fixed_low,

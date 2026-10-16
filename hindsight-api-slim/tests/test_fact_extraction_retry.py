@@ -935,3 +935,44 @@ async def test_drifted_keys_are_named_back_to_the_model_on_retry():
     detail = str(excinfo.value)
     assert "subject, predicate, object, type" in detail or "object, predicate, subject, type" in detail
     assert "what" in detail
+
+
+def _json_error_for(text: str) -> json.JSONDecodeError:
+    """The exact error a provider raises after failing to parse ``text``."""
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as e:
+        return e
+    raise AssertionError(f"{text!r} parsed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I cannot help with that.",
+        # #5516 once counted "no facts" prose as zero facts (#5443), but the same
+        # wording also covers a fault in disguise (#5565), so prose always fails.
+        "No extractable facts were found in the provided chunk.",
+        "no facts could be extracted due to an error",
+        "Rate limited, nothing to extract right now.",
+        # Truncated JSON mentions no facts in prose; it is a real failure.
+        '{"facts": [{"what": "no facts',
+    ],
+)
+async def test_non_json_replies_fail_the_retain(retain_config, reply):
+    """A reply that is not JSON always fails the chunk; only JSON says "zero facts"."""
+    from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
+
+    llm = _make_recording_llm({})
+    llm.call = AsyncMock(side_effect=_json_error_for(reply))
+
+    with pytest.raises(RuntimeError, match="Fact extraction failed: 1/1 chunks failed"):
+        await extract_facts_from_text(
+            text="Alice visited Paris in 2023.",
+            event_date=datetime(2023, 1, 1, tzinfo=timezone.utc),
+            llm_config=llm,
+            agent_name="test-agent",
+            config=retain_config("0"),
+            context="",
+        )

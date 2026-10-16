@@ -212,6 +212,7 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
 
 from hindsight_api.config import ConfigLike, HindsightConfig, StaticConfigProxy, get_config
 from hindsight_api.engine.interface import BankTemplateImportWrite
+from hindsight_api.engine.memories.base import StoreWriteUnavailable
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
     Budget,
@@ -312,8 +313,38 @@ def _internal_error(exc: Exception, where: str) -> HTTPException:
     ``raise _internal_error(e, ...)`` and keep the ``raise`` visible at the
     handler instead of hidden behind a call.
     """
+    unavailable = _store_unavailable(exc)
+    if unavailable is not None:
+        logger.warning(f"Store unavailable in {where}, answering 503: {exc}")
+        return unavailable
     logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _store_unavailable(exc: BaseException) -> HTTPException | None:
+    """The 503 for a store that shed this request, or None if it did not.
+
+    A store that cannot take a request *right now* — a bank briefly closed to writes, or indexing
+    that has fallen behind its writers — raises :class:`StoreWriteUnavailable`. The app-level
+    handler turns it into 503 + ``Retry-After``, but only when it escapes the route; every route's
+    catch-all caught it first and answered 500, which tells a client the request is broken. A bulk
+    ingest that stops on a 500 silently loses the rest of what it was writing.
+
+    Walks the cause/context chain because the engine usually wraps the store's error before a route
+    sees it.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, StoreWriteUnavailable):
+            return HTTPException(
+                status_code=503,
+                detail=str(cur),
+                headers={"Retry-After": str(cur.retry_after)},
+            )
+        cur = cur.__cause__ or cur.__context__
+    return None
 
 
 def _parse_iso_datetime(value: str | None, param: str) -> datetime | None:
@@ -382,10 +413,19 @@ async def run_cancellable_on_disconnect(
     lives in ``ClientDisconnectCancellationMiddleware`` (a pure-ASGI middleware
     installed outside the ``BaseHTTPMiddleware`` layer), which attaches a
     :class:`CancellationToken` to the ASGI scope and trips it on
-    ``http.disconnect``. Here we simply hand that token to the engine via
-    ``RequestContext`` — the engine checks it at stage/iteration boundaries — and
-    translate the resulting ``OperationCancelledError`` into 499 so abandoned
-    work stops instead of running to completion (issue #2122).
+    ``http.disconnect`` (issue #2122).
+
+    The token stops the work two ways, because each covers what the other cannot:
+
+    - It is handed to the engine via ``RequestContext``, which checks it at
+      stage/iteration boundaries. That stops work running in worker threads
+      (recall's graph expansion and reranking), which task cancellation cannot
+      interrupt.
+    - The coroutine runs as a task that is cancelled outright when the token
+      fires. That stops work parked on a single await, which never reaches a
+      checkpoint: an abandoned reflect sat in its closing ``done`` call and the
+      provider's retries, then the standalone fallback and its retries, for ~270s
+      until the wall timeout (issue #5128).
 
     Note: ``Request.is_disconnected()`` is deliberately NOT used — it silently
     never fires behind ``BaseHTTPMiddleware``, which is why the original #2127
@@ -395,7 +435,7 @@ async def run_cancellable_on_disconnect(
     if token is not None:
         request_context.cancellation = token
     try:
-        return await coro
+        return await run_task_cancellable_on_disconnect(http_request, coro, operation=operation, bank_id=bank_id)
     except OperationCancelledError as e:
         logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
         raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
@@ -410,9 +450,8 @@ async def run_task_cancellable_on_disconnect(
 ) -> _T:
     """Run a coroutine as a task and cancel it outright if the client disconnects.
 
-    The cooperative variant above is the right shape for recall and reflect, whose
-    expensive stages run in worker threads that task cancellation cannot interrupt.
-    A synchronous retain is the opposite shape: almost all of its wall time is spent
+    Used directly by sync retain, and under the cooperative variant above by recall
+    and reflect. A synchronous retain is the clearest case: almost all of its wall time is spent
     *awaiting* — queued on the LLM concurrency semaphore, then on the provider's
     response — so a checkpoint between stages never gets a turn, and only real task
     cancellation unblocks it. An abandoned sync retain measured 1880s, holding an LLM
@@ -514,14 +553,14 @@ class RecallRequest(BaseModel):
         default=None,
         description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to all fact types if not specified.",
     )
-    prefer_observations: bool = Field(
-        default=False,
+    prefer_observations: bool | None = Field(
+        default=None,
         description=(
             "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw "
             "fact that an observation in the results was consolidated from, so the observation supersedes "
             "it and you don't get duplicate content. The freed slots are backfilled with the next results, "
-            "keeping the result count at the requested budget. Disabled by default; set to true to enable. "
-            "No effect unless 'observation' and at least one raw type are both requested."
+            "keeping the result count at the requested budget. When omitted, uses the bank/global "
+            "recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested."
         ),
     )
     budget: Budget = Budget.MID
@@ -3975,6 +4014,9 @@ class BankTemplateConfig(BaseModel):
         default=None, description="Number of consolidation LLM batches processed concurrently"
     )
     recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
+    recall_prefer_observations: bool | None = Field(
+        default=None, description="Default for recall prefer_observations when the request omits it"
+    )
     recall_max_tokens: int | None = Field(default=None, description="Max tokens of results returned by recall")
     recall_chunks_max_tokens: int | None = Field(
         default=None, description="Max tokens of raw chunks returned by recall (when recall_include_chunks is set)"
@@ -4903,6 +4945,7 @@ class WebhookDeliveryResponse(BaseModel):
     """Response model for a webhook delivery record."""
 
     id: str
+    event_id: str | None = None
     webhook_id: str | None
     url: str
     event_type: str
@@ -4938,6 +4981,7 @@ class WebhookDeliveryResponse(BaseModel):
 
         return cls(
             id=str(row["operation_id"]),
+            event_id=task_payload.get("event_id"),
             webhook_id=task_payload.get("webhook_id"),
             url=task_payload.get("url", ""),
             event_type=task_payload.get("event_type", ""),
@@ -5602,8 +5646,6 @@ def _register_routes(app: FastAPI):
     # A bank briefly closed to writes — a store migrating it between backends holds it for a few
     # seconds. 503 + Retry-After rather than a 500: nothing is broken, and the difference decides
     # whether a client retries or reports a failure to the user.
-    from ..engine.memories.base import StoreWriteUnavailable
-
     @app.exception_handler(StoreWriteUnavailable)
     async def store_write_unavailable_handler(request, exc: StoreWriteUnavailable):
         return JSONResponse(
@@ -5680,6 +5722,11 @@ def _register_routes(app: FastAPI):
         tags=["Monitoring"],
         operation_id="get_version",
     )
+    # Same handler under /v1, kept out of the OpenAPI spec (it is an alias, not a new operation).
+    # A reverse proxy that routes only /v1 to the API — the Helm chart's default ingress does —
+    # sends a bare /version to the control plane instead, so clients probing capabilities there
+    # silently saw "unsupported" (#5286). Clients try this path first.
+    @app.get("/v1/version", response_model=VersionResponse, include_in_schema=False)
     async def version_endpoint() -> VersionResponse:
         """
         Get API version and enabled features.
@@ -6362,6 +6409,8 @@ def _register_routes(app: FastAPI):
                 detail="Request timed out while searching memories. Try a shorter or more specific query.",
             )
         except Exception as e:
+            if (unavailable := _store_unavailable(e)) is not None:
+                raise unavailable
             import traceback
 
             handler_duration = time.time() - handler_start
@@ -6404,10 +6453,10 @@ def _register_routes(app: FastAPI):
 
             # Use the memory system's reflect_async method (record metrics)
             with metrics.record_operation("reflect", bank_id=bank_id, source="api", budget=request.budget.value):
-                # Cancel the reflect if the client disconnects: the agent loop
-                # checks request_context between iterations and the nested recall
-                # checks at its stage boundaries, so abandoned work stops instead
-                # of running to completion (issue #2122).
+                # Cancel the reflect if the client disconnects: the task is
+                # cancelled outright, so a closing call stuck in provider retries
+                # stops too (#5128), and the nested recall still checks at its
+                # stage boundaries for work in threads (#2122).
                 core_result = await run_cancellable_on_disconnect(
                     http_request,
                     request_context,
@@ -6539,6 +6588,9 @@ def _register_routes(app: FastAPI):
             # evidence it was asked for. Answering anyway would return a confident
             # reply built on a partial (often empty) evidence set, which callers
             # store as a real answer (#2894). Returning the failure lets them retry.
+            # A tool whose recall the store shed is "not now", so it gets the same 503 as recall.
+            if (unavailable := _store_unavailable(e)) is not None:
+                raise unavailable
             logger.warning("Reflect retrieval failure in bank %s: %s", bank_id, e)
             raise HTTPException(status_code=500, detail=str(e))
         except TimeoutError as e:
@@ -10286,6 +10338,8 @@ def _register_routes(app: FastAPI):
                     status_code=422,
                     detail={"violations": [asdict(v) for v in e.violations]},
                 )
+            if (unavailable := _store_unavailable(e)) is not None:
+                raise unavailable
             import traceback
 
             # Create a summary of the input for debugging

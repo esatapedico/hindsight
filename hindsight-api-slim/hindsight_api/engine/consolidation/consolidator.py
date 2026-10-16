@@ -564,6 +564,22 @@ def _resolve_write_scopes(memory: dict[str, Any]) -> list[frozenset[str]]:
     return [frozenset(s) for s in parsed] or [frozenset(tags)]
 
 
+def write_scopes_changed(
+    old_tags: list[str] | None, old_scopes: Any, new_tags: list[str] | None, new_scopes: Any
+) -> bool:
+    """Whether relabelling a memory moves it to a different set of observation scopes.
+
+    Its observations need rebuilding only then: under ``shared`` or an explicit scope list
+    the tags take no part in where observations go, so a tag change alone moves nothing
+    (#5593). Compares the exact scopes :func:`_resolve_write_scopes` resolves before and
+    after, so this and the consolidator can never disagree — a mode change that resolves to
+    the same scopes (``combined`` over ``[a]`` -> ``[["a"]]``) rebuilds nothing either.
+    """
+    return set(_resolve_write_scopes({"tags": old_tags, "observation_scopes": old_scopes})) != set(
+        _resolve_write_scopes({"tags": new_tags, "observation_scopes": new_scopes})
+    )
+
+
 def _batch_scope_signature(memory: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     """The exact set of observation scopes consolidating this memory will write.
 
@@ -2481,7 +2497,19 @@ async def _process_memory_batch(
     # one place. They are still applied first inside the transaction, so an observation
     # slot freed by a delete is available to a create in the same response.
     prepared_deletes: list[str] = []
+    # A response can both UPDATE and DELETE one observation (seen when a fact supersedes it:
+    # the model rewrites it to the new state and also deletes "the old one"). Deletes apply
+    # first, so the update then found no row and was skipped while its source facts were
+    # still stamped consolidated — the new state was lost for good. The update carries the
+    # newer knowledge, so it wins.
+    updated_ids = {u.observation_id for u in llm_result.updates}
     for delete in llm_result.deletes:
+        if delete.observation_id in updated_ids:
+            logger.warning(
+                f"Batch consolidation: dropped delete of observation {delete.observation_id} — "
+                "the same response updates it"
+            )
+            continue
         # Security: the observation must be present in the unioned recall
         if not any(str(obs.id) == delete.observation_id for obs in union_observations):
             logger.debug(

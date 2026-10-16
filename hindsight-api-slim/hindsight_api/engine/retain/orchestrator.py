@@ -489,7 +489,7 @@ from . import (
 from . import timing as _timing
 from .embedding_coalescer import CoalescingEmbedder
 from .entity_labels import label_tag_keys
-from .memory_budget import RetainMemoryBudget, estimate_chunk_bytes
+from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_bytes
 from .types import (
     CausalRelation,
     ChunkMetadata,
@@ -1795,6 +1795,7 @@ async def retain_batch(
         # restate them would erase every name the earlier turns gave. (A SQL bank merges them in
         # `sync_document_attachments` instead, so this stays empty there.)
         prior_filenames: dict[str, str] = base.attachment_filenames if base else {}
+        first = contents_dicts[0]
         if existing_text:
             # Prepend existing text as a new content item at the beginning.
             #
@@ -1805,16 +1806,19 @@ async def retain_batch(
             # `strategy` that way (#4590); the same list in `merged_item` below also dropped the
             # caller's `entities`, which that branch is the only carrier of. `{**item, "content":
             # ...}` is how the oversized-item splitter already re-slices an item, so the two agree.
-            first = contents_dicts[0]
             existing_content = cast(RetainContentDict, {**first, "content": existing_text})
             existing_content.pop("attachment_filenames", None)
             if prior_filenames:
                 # The stored document's names, not the new turn's: they describe the base text.
                 existing_content["attachment_filenames"] = prior_filenames
             contents_dicts = [existing_content, *contents_dicts]
+        if len(contents_dicts) > 1:
             # Collapse to the merged array when every part is one, so `original_text` stays valid
             # JSON (#2409). `merge_json_array_parts` is the same function the splitter predicts an
             # oversized append's body with, so the two cannot disagree about what this produces.
+            # Runs with no stored body too: queued appends to a document that does not exist yet
+            # are folded into this one call (`engine/retain/fold.py`); without merging here
+            # their parts were newline-joined into `[...]\n[...]`.
             _merged_text = merge_json_array_parts([_item.get("content", "") for _item in contents_dicts])
             if _merged_text is not None:
                 merged_item = cast(RetainContentDict, {**first, "content": _merged_text})
@@ -1824,8 +1828,10 @@ async def retain_batch(
                 if merged_filenames:
                     merged_item["attachment_filenames"] = merged_filenames
                 contents_dicts = [merged_item]
-            # Rebuild contents list to match
-            contents = _build_contents(contents_dicts, document_tags)
+            if existing_text or _merged_text is not None:
+                # Rebuild contents list to match
+                contents = _build_contents(contents_dicts, document_tags)
+        if existing_text:
             log_buffer.append(
                 f"[append] Prepended {len(existing_text):,} chars from existing document {effective_doc_id}"
             )
@@ -2874,7 +2880,10 @@ async def _streaming_retain_batch(
                 logger.debug("retain chunk-progress write failed", exc_info=True)
 
         while True:
-            item = await chunk_queue.get()
+            # With an open batch, also wake when the producer blocks on the budget: that batch
+            # may be what it is waiting on, and it can't send the next item until it is
+            # written (#5296).
+            item = await memory_budget.next_item_or_producer_waiting(chunk_queue) if batch else await chunk_queue.get()
             if item is None:
                 # Process any remaining items
                 if batch and not pipeline_aborted[0]:
@@ -2890,14 +2899,17 @@ async def _streaming_retain_batch(
                 batch_bytes = 0
                 break
 
-            batch.append(item)
-            batch_bytes += reserved_by_chunk.get(item[0], 0)
+            producer_waiting = item is PRODUCER_WAITING
+            if not producer_waiting:
+                batch.append(item)
+                batch_bytes += reserved_by_chunk.get(item[0], 0)
 
-            # Write on whichever comes first: the configured chunk count, or an open batch
-            # heavy enough that holding more would crowd out the producer (#3756). The
+            # Write on whichever comes first: the configured chunk count, an open batch
+            # heavy enough that holding more would crowd out the producer (#3756), or a
+            # producer already blocked on the budget with nothing left queued (#5296). The
             # count alone let a batch of fact-dense chunks grow far past any memory a
             # worker was sized for.
-            if len(batch) >= chunk_batch_size or memory_budget.should_flush(batch_bytes):
+            if producer_waiting or len(batch) >= chunk_batch_size or memory_budget.should_flush(batch_bytes):
                 if pipeline_aborted[0]:
                     # Another request took over the document — discard this batch
                     log_buffer.append(

@@ -2524,24 +2524,24 @@ class TestConcurrentWorkers:
         # worker's claims down to our bank — parallel test files may contribute
         # other pending rows that these workers legitimately pick up.
         workers_claimed: dict[str, list[str]] = {"worker-1": [], "worker-2": [], "worker-3": []}
+        pollers = {
+            worker_id: WorkerPoller(backend=backend, worker_id=worker_id, executor=lambda x: None)
+            for worker_id in workers_claimed
+        }
 
         async def claim_for_worker(worker_id: str):
-            poller = WorkerPoller(
-                backend=backend,
-                worker_id=worker_id,
-                executor=lambda x: None,
-            )
-            claimed = await poller.claim_batch()
-            workers_claimed[worker_id] = [
+            claimed = await pollers[worker_id].claim_batch()
+            workers_claimed[worker_id] += [
                 task.operation_id for task in claimed if task.task_dict.get("bank_id") == bank_id
             ]
 
-        # Run all workers concurrently
-        await asyncio.gather(
-            claim_for_worker("worker-1"),
-            claim_for_worker("worker-2"),
-            claim_for_worker("worker-3"),
-        )
+        # Poll all workers concurrently, a few cycles. One cycle need not drain everything: a
+        # candidate lost to SKIP LOCKED makes a claim return fewer rows than are free, and the next
+        # poll takes it (see _claim_shared_tasks). Asserting on a single cycle failed in CI with 9/10.
+        for _ in range(5):
+            await asyncio.gather(*(claim_for_worker(worker_id) for worker_id in workers_claimed))
+            if sum(len(claimed) for claimed in workers_claimed.values()) >= 10:
+                break
 
         # Verify no duplicates - each task claimed by exactly one worker
         all_claimed = workers_claimed["worker-1"] + workers_claimed["worker-2"] + workers_claimed["worker-3"]
@@ -3761,14 +3761,15 @@ async def test_pending_breakdown_explains_unclaimable_rows(pool, backend, clean_
     #   * retry_blocked - failed once, scheduled an hour out
     #   * assigned      - worker_id stamped (e.g. left over from a prior crash
     #                     that re-queued without clearing worker_id)
-    #   * claimable     - normal retain ready to go
-    #   * consolidation - normal consolidation, also claimable
+    #   * a plain retain and a plain consolidation, which land in `total`
+    #     only — the line reports no `claimable` residual (#4527), because the
+    #     claim query's serialization predicates are not modelled here.
     rows = [
         ("batch_retain", None, None, None),  # payload_null
         ("retain", json.dumps({"type": "test"}), "future", None),  # retry_blocked
         ("retain", json.dumps({"type": "test"}), None, "ghost-worker"),  # assigned
-        ("retain", json.dumps({"type": "test"}), None, None),  # claimable
-        ("consolidation", json.dumps({"type": "test"}), None, None),  # claimable
+        ("retain", json.dumps({"type": "test"}), None, None),
+        ("consolidation", json.dumps({"type": "test"}), None, None),
     ]
     for op_type, payload, retry_marker, worker_id in rows:
         op_id = uuid.uuid4()
@@ -3816,8 +3817,11 @@ async def test_pending_breakdown_explains_unclaimable_rows(pool, backend, clean_
     assert buckets["batch_retain"]["payload_null"] >= 1
     assert buckets["retain"]["retry_blocked"] >= 1
     assert buckets["retain"]["assigned"] >= 1
-    assert buckets["retain"]["claimable"] >= 1
-    assert buckets["consolidation"]["claimable"] >= 1
+    assert buckets["retain"]["total"] >= 3
+    assert buckets["consolidation"]["total"] >= 1
+    # No claimable residual: it ignored the claim query's serialization
+    # predicates and overstated what the next poll would pick up (#4527).
+    assert "claimable" not in buckets["retain"]
 
 
 class TestSummariseChildErrorMessages:
