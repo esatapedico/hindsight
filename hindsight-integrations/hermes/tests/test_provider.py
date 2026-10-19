@@ -11,7 +11,15 @@ import pytest
 
 import hindsight_hermes as plugin
 from conftest import FakeClient, FakeRecallResponse
-from hindsight_client_api.exceptions import NotFoundException
+
+try:
+    from hindsight_client_api.exceptions import NotFoundException
+except ModuleNotFoundError:  # SDK not installed on this host; the plugin only reads .status
+    class NotFoundException(Exception):
+        def __init__(self, status=None, reason=None):
+            super().__init__(reason)
+            self.status = status
+            self.reason = reason
 
 
 def _retain_item(fake: FakeClient, index: int = 0) -> dict:

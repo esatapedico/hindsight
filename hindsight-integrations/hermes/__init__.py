@@ -2095,7 +2095,6 @@ class HindsightMemoryProvider(MemoryProvider):
         """End boundary (the transcript arrives as the first positional argument)."""
         self._forget_seen_entries()
         self._delegate_session_hook("on_session_end", *args, **kwargs)
-: inject each recalled memory entry once per session)
 
     def on_session_switch(
         self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs

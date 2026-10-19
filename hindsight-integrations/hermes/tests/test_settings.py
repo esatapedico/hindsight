@@ -39,7 +39,6 @@ def test_observation_scopes_normalization():
     assert _normalize_observation_scopes("shared") == "shared"
     assert _normalize_observation_scopes("combined") == "combined"
     assert _normalize_observation_scopes("all_combinations") == "all_combinations"
-: recognize shared observation scope keyword in settings (#4845))
     assert _normalize_observation_scopes(["a", "b"]) == [["a", "b"]]
     assert _normalize_observation_scopes([["a"], ["b"]]) == [["a"], ["b"]]
     assert _normalize_observation_scopes("garbage") is None
