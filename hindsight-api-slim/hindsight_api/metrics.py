@@ -686,7 +686,7 @@ class MetricsCollector(MetricsCollectorBase):
             budget: Optional budget level (low, mid, high)
             max_tokens: Optional max tokens for the operation
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         success = True
         cancelled = False
         # Resolved once, and published for the length of the operation so the recall phases
@@ -715,7 +715,7 @@ class MetricsCollector(MetricsCollectorBase):
                     operation,
                     bank_id,
                     success=success,
-                    duration=time.time() - start_time,
+                    duration=time.perf_counter() - start_time,
                     source=source,
                     budget=budget,
                     max_tokens=max_tokens,
@@ -864,7 +864,7 @@ class MetricsCollector(MetricsCollectorBase):
             endpoint: Request endpoint path
             status_code_getter: Callable that returns the status code after request completes
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         base_attributes = {"method": method, "endpoint": endpoint}
 
         # Track in-progress
@@ -873,7 +873,7 @@ class MetricsCollector(MetricsCollectorBase):
         try:
             yield
         finally:
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             status_code = status_code_getter()
             status_class = f"{status_code // 100}xx"
 
@@ -1236,6 +1236,7 @@ class MetricsCollector(MetricsCollectorBase):
         per_bank = self._include_bank_id
         bank_sel = "bank_id, " if per_bank else ""
         from .engine.memories import get_memories
+        from .engine.memory_engine import _current_schema
 
         async with self._db_pool.acquire() as conn:
             # memory_units is the central per-tenant table; its presence marks a
@@ -1280,25 +1281,32 @@ class MetricsCollector(MetricsCollectorBase):
                     rows = await conn.fetch(f'SELECT bank_id FROM "{schema}".banks')
                     return [row["bank_id"] for row in rows]
 
+                # A store-owned backend derives where a bank's memories live from the request
+                # schema, so set it as a request would; left unset, every schema's banks resolve
+                # against the default schema and drop out of these gauges.
+                token = _current_schema.set(schema)
                 try:
-                    counts = await get_memories().count_consolidation_backlog(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        backlog[key] = backlog.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_backlog(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            backlog[key] = backlog.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
 
-                try:
-                    counts = await get_memories().count_consolidation_failed(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        failed[key] = failed.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_failed(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            failed[key] = failed.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                finally:
+                    _current_schema.reset(token)
 
         self._async_ops_counts = async_ops
         self._consolidation_backlog = backlog

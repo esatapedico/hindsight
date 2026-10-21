@@ -41,6 +41,7 @@ def test_list_forwards_every_supported_query_option(monkeypatch):
         detail="metadata",
         limit=25,
         offset=50,
+        exclude_knowledge_pages=True,
     )
 
     assert captured["bank_id"] == "bank-1"
@@ -50,6 +51,7 @@ def test_list_forwards_every_supported_query_option(monkeypatch):
     assert kwargs["detail"] == "metadata"
     assert kwargs["limit"] == 25
     assert kwargs["offset"] == 50
+    assert kwargs["exclude_knowledge_pages"] is True
 
 
 def test_list_defaults_leave_controls_unset(monkeypatch):
@@ -66,6 +68,7 @@ def test_list_defaults_leave_controls_unset(monkeypatch):
     assert kwargs["detail"] is None
     assert kwargs["limit"] is None
     assert kwargs["offset"] is None
+    assert kwargs["exclude_knowledge_pages"] is None
 
 
 def test_list_tags_only_shape_preserved(monkeypatch):
@@ -100,3 +103,25 @@ def test_get_defaults_leave_detail_unset(monkeypatch):
     client.get_mental_model("bank-1", "model-1")
 
     assert captured["kwargs"]["detail"] is None
+
+
+def _capture_refresh(monkeypatch, client, captured):
+    async def fake_refresh(bank_id, mental_model_id, **kwargs):
+        captured["bank_id"] = bank_id
+        captured["mental_model_id"] = mental_model_id
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr(client._mental_models_api, "refresh_mental_model", fake_refresh)
+
+
+def test_refresh_forwards_a_full_mode_and_sends_no_body_without_one(monkeypatch):
+    client = Hindsight(base_url="http://example.invalid")
+    captured: dict[str, object] = {}
+    _capture_refresh(monkeypatch, client, captured)
+
+    client.refresh_mental_model("bank-1", "model-1", mode="full")
+    assert captured["kwargs"]["refresh_mental_model_request"].mode == "full"
+
+    client.refresh_mental_model("bank-1", "model-1")
+    assert captured["kwargs"]["refresh_mental_model_request"] is None

@@ -34,8 +34,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   ChevronDown,
   ChevronRight,
+  Download,
   FilePlus,
   FileText,
   Folder,
@@ -56,10 +63,11 @@ import { useRefreshAttempts, type RefreshAttempt } from "@/lib/use-refresh-attem
 import { FreshnessLine } from "./freshness-line";
 import { MentalModelDetailModal } from "./mental-model-detail-modal";
 import { KnowledgeSearchDialog } from "./knowledge-search-dialog";
-import { isKnowledgeTagFilterActive } from "./knowledge-tag-filter";
 import { TagChip } from "@/components/ui/facet-chip";
 import { KnowledgeSearchResult, type KnowledgeSearchHit } from "./knowledge-search-result";
 import { buildPathIndex } from "@/lib/knowledge-path";
+import { isTagFilterActive } from "@/lib/tag-filter-params";
+import { downloadMarkdown, printPage } from "@/lib/page-download";
 import { UpdateMentalModelDialog } from "./mental-models-view";
 
 type PageDetail = Awaited<ReturnType<typeof client.getKnowledgePage>>;
@@ -70,6 +78,9 @@ const ROOT_ID = "";
 // How often the tree view silently re-polls so page stats (last refresh / sync
 // status) stay live while pages refresh in the background.
 const AUTO_REFRESH_MS = 12000;
+
+// The sidebar filter before the user touches it, and what the clear button restores.
+const DEFAULT_TAG_FILTER: KnowledgeTagFilter = { tags_match: "any_strict" };
 
 /** Shared empty map, so a TreeRow without in-flight data does not remount on every render. */
 const EMPTY_ATTEMPTS: Map<string, RefreshAttempt> = new Map();
@@ -115,8 +126,8 @@ export function KnowledgeBaseView() {
   // Tag filter applied to both the tree and the search (recall's tags / tags_match).
   // `#tag` typed in the search box becomes a chip; strict by default, so a tag
   // filter shows only pages carrying the tag (the advanced dialog can widen it).
-  const [tagFilter, setTagFilter] = useState<KnowledgeTagFilter>({ tags_match: "any_strict" });
-  const tagFilterActive = isKnowledgeTagFilterActive(tagFilter);
+  const [tagFilter, setTagFilter] = useState<KnowledgeTagFilter>(DEFAULT_TAG_FILTER);
+  const tagFilterActive = isTagFilterActive(tagFilter);
   const removeTag = (tag: string) =>
     setTagFilter((f) => ({ ...f, tags: (f.tags ?? []).filter((x) => x !== tag) }));
   // Enter/space/comma closes a `#tag` token into a chip; backspace on an empty box pops one.
@@ -506,9 +517,10 @@ export function KnowledgeBaseView() {
 
   return (
     <div>
-      {/* Obsidian-style workspace: one frame, a file-explorer sidebar + editor pane. */}
-      <div className="flex items-stretch overflow-hidden h-[calc(100vh-13rem)] min-h-[520px]">
-        <aside className="w-1/3 flex-shrink-0 bg-muted/30 border-r border-border flex flex-col">
+      {/* Obsidian-style workspace: one frame, a file-explorer sidebar + editor pane.
+          On phones the explorer stacks above the page instead of squeezing beside it. */}
+      <div className="flex flex-col md:flex-row items-stretch overflow-hidden h-[calc(100dvh-13rem)] min-h-[520px]">
+        <aside className="w-full max-h-[45%] md:w-1/3 md:max-h-none flex-shrink-0 bg-muted/30 border-b md:border-b-0 md:border-r border-border flex flex-col">
           {/* One box for both filters: free text runs the hybrid search, `#tag` tokens
               become chips that filter the tree and the search alike. The sliders open
               the same filter against the raw endpoints. */}
@@ -536,7 +548,8 @@ export function KnowledgeBaseView() {
                 <button
                   onClick={() => {
                     setQuery("");
-                    setTagFilter({ ...tagFilter, tags: [] });
+                    // The whole filter: a kept `exact` would still filter (the untagged scope).
+                    setTagFilter(DEFAULT_TAG_FILTER);
                   }}
                   className="absolute right-1.5 top-1.5 rounded p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted"
                   aria-label={t("clearSearch")}
@@ -663,13 +676,48 @@ export function KnowledgeBaseView() {
               <Spinner size="lg" variant="jump" />
             </div>
           ) : selected ? (
-            <div className="p-8 max-w-3xl mx-auto">
-              <div className="flex items-start justify-between gap-3">
-                <h1 className="text-2xl font-bold text-foreground">{selected.name}</h1>
-                <Button variant="outline" size="sm" onClick={openEdit} className="shrink-0">
-                  <Pencil className="w-3.5 h-3.5 mr-1.5" />
-                  {t("editButton")}
-                </Button>
+            <div className="p-4 sm:p-8 max-w-3xl mx-auto">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <h1 className="min-w-0 break-words text-2xl font-bold text-foreground">
+                  {selected.name}
+                </h1>
+                <div className="flex gap-2 shrink-0">
+                  {selected.body && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="outline" size="sm">
+                          <Download className="w-3.5 h-3.5 mr-1.5" />
+                          {t("downloadButton")}
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onClick={() =>
+                            printPage({
+                              name: selected.name,
+                              body: selected.body ?? "",
+                              updatedAt: selected.timestamp,
+                              tags: selected.tags,
+                            })
+                          }
+                        >
+                          {t("downloadPdf")}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() =>
+                            downloadMarkdown({ name: selected.name, body: selected.body ?? "" })
+                          }
+                        >
+                          {t("downloadMarkdown")}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                  <Button variant="outline" size="sm" onClick={openEdit}>
+                    <Pencil className="w-3.5 h-3.5 mr-1.5" />
+                    {t("editButton")}
+                  </Button>
+                </div>
               </div>
 
               <div className="mt-1.5 flex items-center gap-3 flex-wrap">

@@ -39,6 +39,11 @@ class ChatRequest:
     messages: list[dict[str, Any]]
     tools: tuple[str, ...] = ()
     """Names of the tools offered on this call, when it is a tool-using turn."""
+    api_key: str | None = None
+    """The bearer key the call was sent with — for the stories about whose account a
+    call is billed to."""
+    headers: dict[str, str] = field(default_factory=dict, compare=False)
+    """The request headers, lowercased."""
 
     @property
     def user_text(self) -> str:
@@ -84,6 +89,9 @@ class StubbedReply:
 
     error_status: int | None = None
     """When set, the stub answers with a provider error at this HTTP status instead."""
+
+    retry_after_seconds: int | None = None
+    """Sent as the error's ``Retry-After`` header: when a rate-limited provider says it resets."""
 
 
 @dataclass(frozen=True)
@@ -148,14 +156,17 @@ class RuleBuilder:
             )
         )
 
-    def fails_with_status(self, status: int) -> LLMStub:
+    def fails_with_status(self, status: int, *, retry_after_seconds: int | None = None) -> LLMStub:
         """Answer with a provider error at ``status`` — a 429 or a 5xx, say.
 
         For stories about how the server treats a provider that is down or
-        rate-limited, which no successful reply can stand in for.
+        rate-limited, which no successful reply can stand in for. ``retry_after_seconds``
+        is the provider's reported quota reset, which the worker defers the operation to.
         """
         return self._register(
-            lambda _request: StubbedReply(message={}, finish_reason="error", error_status=status)
+            lambda _request: StubbedReply(
+                message={}, finish_reason="error", error_status=status, retry_after_seconds=retry_after_seconds
+            )
         )
 
     def returns_text(self, text: str) -> LLMStub:
@@ -444,6 +455,10 @@ class LLMStub:
 class EmbeddingStub:
     """Deterministic embeddings — see ``lexical.py`` for why word overlap suffices."""
 
+    #: Answer every call with this provider error instead — a 429 or a 5xx — for the
+    #: stories about what the server leaves behind when its embeddings backend is down.
+    fail_with_status: int | None = None
+
     def embed(self, text: str) -> list[float]:
         from .lexical import lexical_embedding
 
@@ -458,10 +473,55 @@ class RerankStub:
     #: keep more. Ignored by the Cohere-shaped /rerank endpoint, which has no cut.
     cut_level: int = 0
 
+    #: What a decision model's per-memory question answers, keyed by text the memory
+    #: contains. Memories matching none are scored lexically, where ties fall back to
+    #: retrieval order, which is not stable enough to pin.
+    verdicts: dict[str, float]
+
+    #: The state each of those questions arrived with, so a story can see what the
+    #: model was told besides the memory.
+    states: list[str]
+
+    def __init__(self) -> None:
+        self.verdicts = {}
+        self.states = []
+
+    def verdict(self, state: str, memory: str) -> float:
+        scripted = next((score for text, score in self.verdicts.items() if text in memory), None)
+        return self.score(state, memory) if scripted is None else scripted
+
     def score(self, query: str, document: str) -> float:
         from .lexical import lexical_relevance
 
         return lexical_relevance(query, document)
+
+
+class TriageStub:
+    """Consolidation triage verdicts, scripted per fact.
+
+    Triage asks TypeSafe, per new fact, how it relates to the observations shown
+    (``relation``), which one it restates (``match`` / ``covers_oN``) and which it makes
+    should be reworded (``touches_oN``); under a bank's own mission also whether the mission
+    would keep the fact as stated (``keep_as``); every judgment is a choice. A story names the verdict for a
+    fact by a phrase in its text; every other fact gets "changes" with nothing flagged
+    and no mission fit, which hands it to the LLM — what an unconfigured stub must do so
+    no story is settled by accident.
+    """
+
+    def __init__(self) -> None:
+        self.verdicts: dict[str, str] = {}
+        #: Phrases of facts the bank's mission wants, worded as it allows.
+        self.fits_mission: set[str] = set()
+
+    def relation(self, fact_text: str) -> str:
+        return next((v for phrase, v in self.verdicts.items() if phrase in fact_text), "changes")
+
+    def fits(self, fact_text: str) -> bool:
+        return any(phrase in fact_text for phrase in self.fits_mission)
+
+    def reset(self) -> None:
+        self.verdicts.clear()
+        self.fits_mission.clear()
 
 
 @dataclass(frozen=True)
@@ -472,6 +532,18 @@ class ReceivedWebhook:
     body: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class TokenExchange:
+    """One Workload Identity Federation exchange at ``/v1/oauth/token``: the identity
+    the server presented, and the short-lived access token the stub issued for it."""
+
+    assertion: str
+    federation_rule_id: str
+    organization_id: str
+    service_account_id: str | None
+    access_token: str
+
+
 @dataclass
 class Stubs:
     """The three backends a test configures, handed to it as one object."""
@@ -479,6 +551,7 @@ class Stubs:
     llm: LLMStub = field(default_factory=LLMStub)
     embeddings: EmbeddingStub = field(default_factory=EmbeddingStub)
     rerank: RerankStub = field(default_factory=RerankStub)
+    triage: TriageStub = field(default_factory=TriageStub)
     rejected_requests: list[str] = field(default_factory=list)
     """Requests the stub refused as malformed — see ``validation.py``."""
 
@@ -491,12 +564,21 @@ class Stubs:
     tried rather than that anything arrived.
     """
 
+    token_exchanges: list[TokenExchange] = field(default_factory=list)
+    """Every federation token exchange, in arrival order. Not cleared by ``reset``: a
+    server exchanges once at startup and then reuses the token until it nears expiry,
+    so the exchange that issued a story's token usually predates the story."""
+
     def reset(self) -> None:
         """Between tests. The embedding stub is pure; the rerank stub is pure apart
-        from the cut level a story may have raised, which has to go back to its
-        default or it leaks into whatever runs next."""
+        from what a story set on it (cut level, verdicts) or it recorded, which has to
+        go back to its default or it leaks into whatever runs next."""
         self.llm.reset()
+        self.embeddings.fail_with_status = None
         self.rerank.cut_level = RerankStub.cut_level
+        self.rerank.verdicts = {}
+        self.rerank.states = []
+        self.triage.reset()
         self.rejected_requests.clear()
         self.webhooks.clear()
 

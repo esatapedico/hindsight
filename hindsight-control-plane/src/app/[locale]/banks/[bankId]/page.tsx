@@ -28,6 +28,7 @@ import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
 import { client } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -88,6 +89,17 @@ type BankConfigTab =
   | "audit-logs"
   | "llm-requests";
 
+const LAST_DATA_SUB_TAB_KEY = "hindsight.memories.subTab";
+
+function readLastDataSubTab(): DataSubTab | null {
+  try {
+    const v = localStorage.getItem(LAST_DATA_SUB_TAB_KEY);
+    return v === "world" || v === "experience" || v === "observations" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function BankPage() {
   const params = useParams();
   const router = useRouter();
@@ -98,7 +110,15 @@ export default function BankPage() {
   const { currentBank: bankId, setCurrentBank, loadBanks } = useBank();
 
   const view = (searchParams.get("view") || "home") as NavItem;
-  const subTab = (searchParams.get("subTab") || "world") as DataSubTab;
+  // Memories reopens on the sub-tab the user last picked, not always World —
+  // unless the URL names one, so a shared link still wins. `undefined` until
+  // storage has been read after mount (it can't be read during server render),
+  // and the tab body waits for it so World isn't loaded only to be thrown away.
+  const urlSubTab = searchParams.get("subTab") as DataSubTab | null;
+  const [lastSubTab, setLastSubTab] = useState<DataSubTab | null | undefined>(undefined);
+  useEffect(() => setLastSubTab(readLastDataSubTab()), []);
+  const subTab: DataSubTab = urlSubTab || lastSubTab || "world";
+  const subTabReady = urlSubTab !== null || lastSubTab !== undefined;
   const knowledgeTab = (searchParams.get("knowledgeTab") || "pages") as KnowledgeTab;
   const bankConfigTab = (searchParams.get("bankConfigTab") || "general") as BankConfigTab;
   const bankConfigEnabled = features?.bank_config_api ?? false;
@@ -144,6 +164,10 @@ export default function BankPage() {
   }, [bankId, bankConfigEnabled]);
   const auditLogEnabled = bankAuditLogEnabled ?? features?.audit_log ?? false;
   const observationsEnabled = bankObservationsEnabled ?? features?.observations ?? false;
+  // The fact types behind the Memories tabs, so each tab can warm the others.
+  const memoryTabTypes: ("world" | "experience" | "observation")[] = observationsEnabled
+    ? ["world", "experience", "observation"]
+    : ["world", "experience"];
 
   // Bank actions state
   const [showLlmHealthDialog, setShowLlmHealthDialog] = useState(false);
@@ -172,7 +196,14 @@ export default function BankPage() {
 
   const handleDataSubTabChange = (newSubTab: DataSubTab) => {
     if (!bankId) return;
-    router.push(bankRoute(bankId, `?view=data&subTab=${newSubTab}`));
+    try {
+      localStorage.setItem(LAST_DATA_SUB_TAB_KEY, newSubTab);
+    } catch {
+      // Storage blocked: the tab just won't be remembered.
+    }
+    // The native history API updates useSearchParams without a router round
+    // trip, so the tab switches on the click instead of after a navigation.
+    window.history.pushState(null, "", `?view=data&subTab=${newSubTab}`);
   };
 
   const handleKnowledgeTabChange = (tab: KnowledgeTab) => {
@@ -300,10 +331,11 @@ export default function BankPage() {
   };
 
   return (
-    // Pinned to the viewport (h-screen, not min-h-screen) so `main` below is
+    // Pinned to the viewport (h-dvh, not min-h-screen) so `main` below is
     // the only scroll container: with min-h-screen the page itself grew past
-    // the viewport and scrolled the header and sidebar out of view.
-    <div className="h-screen overflow-hidden bg-background flex flex-col">
+    // the viewport and scrolled the header and sidebar out of view. dvh, not
+    // vh: on iOS 100vh runs under Safari's URL bar and hides the bottom.
+    <div className="h-dvh overflow-hidden bg-background flex flex-col">
       <div className="shrink-0">
         <BankSelector />
       </div>
@@ -312,7 +344,7 @@ export default function BankPage() {
         <Sidebar currentTab={view} onTabChange={handleTabChange} />
 
         <main className="flex-1 min-w-0 overflow-y-auto">
-          <div className="p-6">
+          <div className="p-4 sm:p-6 pb-[max(1rem,env(safe-area-inset-bottom))]">
             {/* Content width staircase. Without a cap the views ran the full
                 width of the window, which on a 16" display left body text and
                 table rows spanning ~1700px. The Kit specifies a flat 1024px;
@@ -455,103 +487,22 @@ export default function BankPage() {
                     </DropdownMenu>
                   </div>
 
-                  {/* Sub-tabs */}
-                  <div className="mb-6 border-b border-border">
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => handleBankConfigTabChange("general")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          bankConfigTab === "general"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("general")}
-                        {bankConfigTab === "general" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      {bankConfigEnabled && (
-                        <button
-                          onClick={() => handleBankConfigTabChange("memory-defense")}
-                          className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                            bankConfigTab === "memory-defense"
-                              ? "text-primary"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                        >
-                          {t("memoryDefense")}
-                          {bankConfigTab === "memory-defense" && (
-                            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                          )}
-                        </button>
-                      )}
-                      {bankConfigEnabled && (
-                        <button
-                          onClick={() => handleBankConfigTabChange("configuration")}
-                          className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                            bankConfigTab === "configuration"
-                              ? "text-primary"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                        >
-                          {t("configuration")}
-                          {bankConfigTab === "configuration" && (
-                            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                          )}
-                        </button>
-                      )}
-                      <button
-                        onClick={() => handleBankConfigTabChange("webhooks")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          bankConfigTab === "webhooks"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("webhooks")}
-                        {bankConfigTab === "webhooks" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => handleBankConfigTabChange("audit-logs")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          bankConfigTab === "audit-logs"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("auditLogs")}
-                        {!auditLogEnabled && (
-                          <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                            Off
-                          </span>
-                        )}
-                        {bankConfigTab === "audit-logs" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => handleBankConfigTabChange("llm-requests")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          bankConfigTab === "llm-requests"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("llmRequests")}
-                        {!llmTraceEnabled && (
-                          <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                            Off
-                          </span>
-                        )}
-                        {bankConfigTab === "llm-requests" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                    </div>
-                  </div>
+                  <UnderlineTabs
+                    value={bankConfigTab}
+                    onChange={handleBankConfigTabChange}
+                    tabs={[
+                      { id: "general", label: t("general") },
+                      ...(bankConfigEnabled
+                        ? [
+                            { id: "memory-defense" as const, label: t("memoryDefense") },
+                            { id: "configuration" as const, label: t("configuration") },
+                          ]
+                        : []),
+                      { id: "webhooks", label: t("webhooks") },
+                      { id: "audit-logs", label: t("auditLogs"), off: !auditLogEnabled },
+                      { id: "llm-requests", label: t("llmRequests"), off: !llmTraceEnabled },
+                    ]}
+                  />
 
                   {/* Tab content */}
                   <div>
@@ -653,79 +604,53 @@ export default function BankPage() {
                   <h1 className="text-3xl font-bold mb-2 text-foreground">{t("memories")}</h1>
                   <p className="text-muted-foreground mb-6">{t("memoriesDescription")}</p>
 
-                  <div className="mb-6 border-b border-border">
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => handleDataSubTabChange("world")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          subTab === "world"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("worldFacts")}
-                        {subTab === "world" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => handleDataSubTabChange("experience")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          subTab === "experience"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("experience")}
-                        {subTab === "experience" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => handleDataSubTabChange("observations")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          subTab === "observations"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("observations")}
-                        {!observationsEnabled && (
-                          <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                            Off
-                          </span>
-                        )}
-                        {subTab === "observations" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                    </div>
-                  </div>
+                  <UnderlineTabs
+                    value={subTab}
+                    onChange={handleDataSubTabChange}
+                    tabs={[
+                      { id: "world", label: t("worldFacts") },
+                      { id: "experience", label: t("experience") },
+                      { id: "observations", label: t("observations"), off: !observationsEnabled },
+                    ]}
+                  />
 
                   <div>
-                    {subTab === "world" && (
+                    {subTabReady && subTab === "world" && (
                       <div>
                         <p className="text-sm text-muted-foreground mb-4">
                           {t("worldFactsDescription")}
                         </p>
-                        <DataView key="world" factType="world" />
+                        <DataView
+                          key="world"
+                          factType="world"
+                          prefetchTypes={memoryTabTypes.filter((ft) => ft !== "world")}
+                        />
                       </div>
                     )}
-                    {subTab === "experience" && (
+                    {subTabReady && subTab === "experience" && (
                       <div>
                         <p className="text-sm text-muted-foreground mb-4">
                           {t("experienceDescription")}
                         </p>
-                        <DataView key="experience" factType="experience" />
+                        <DataView
+                          key="experience"
+                          factType="experience"
+                          prefetchTypes={memoryTabTypes.filter((ft) => ft !== "experience")}
+                        />
                       </div>
                     )}
-                    {subTab === "observations" &&
+                    {subTabReady &&
+                      subTab === "observations" &&
                       (observationsEnabled ? (
                         <div>
                           <p className="text-sm text-muted-foreground mb-4">
                             {t("observationsDescription")}
                           </p>
-                          <DataView key="observations" factType="observation" />
+                          <DataView
+                            key="observations"
+                            factType="observation"
+                            prefetchTypes={memoryTabTypes.filter((ft) => ft !== "observation")}
+                          />
                         </div>
                       ) : (
                         <FeatureNotEnabled
@@ -766,36 +691,15 @@ export default function BankPage() {
                   <h1 className="text-3xl font-bold mb-2 text-foreground">{t("knowledge")}</h1>
                   <p className="text-muted-foreground mb-4">{t("knowledgeDescription")}</p>
 
-                  <div className="mb-4 border-b border-border">
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => handleKnowledgeTabChange("pages")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          knowledgeTab === "pages"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("pages")}
-                        {knowledgeTab === "pages" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => handleKnowledgeTabChange("models")}
-                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                          knowledgeTab === "models"
-                            ? "text-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {t("mentalModels")}
-                        {knowledgeTab === "models" && (
-                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-gradient" />
-                        )}
-                      </button>
-                    </div>
-                  </div>
+                  <UnderlineTabs
+                    className="mb-4"
+                    value={knowledgeTab}
+                    onChange={handleKnowledgeTabChange}
+                    tabs={[
+                      { id: "pages", label: t("pages") },
+                      { id: "models", label: t("mentalModels") },
+                    ]}
+                  />
 
                   {/* Keyed by bank so switching banks remounts the view: every
                       bank-scoped piece of state (tree, open tabs, selected page and

@@ -10,7 +10,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "0.10.3"
+    "version": "1.0.0"
   },
   "paths": {
     "/health": {
@@ -175,8 +175,10 @@
                   "type": "null"
                 }
               ],
+              "description": "Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that.",
               "title": "Q"
-            }
+            },
+            "description": "Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that."
           },
           {
             "name": "tags",
@@ -202,6 +204,13 @@
             "in": "query",
             "required": false,
             "schema": {
+              "enum": [
+                "any",
+                "all",
+                "any_strict",
+                "all_strict",
+                "exact"
+              ],
               "type": "string",
               "default": "all_strict",
               "title": "Tags Match"
@@ -289,7 +298,7 @@
           "Memory"
         ],
         "summary": "List memory units",
-        "description": "List memory units with pagination and optional full-text search. Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.",
+        "description": "List memory units with pagination and an optional substring filter (`q`). Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.",
         "operationId": "list_memories",
         "parameters": [
           {
@@ -330,8 +339,10 @@
                   "type": "null"
                 }
               ],
+              "description": "Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that.",
               "title": "Q"
-            }
+            },
+            "description": "Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that."
           },
           {
             "name": "consolidation_state",
@@ -1936,6 +1947,18 @@
             }
           },
           {
+            "name": "exclude_knowledge_pages",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Leave out the mental models that hold knowledge page content (list standalone models only).",
+              "default": false,
+              "title": "Exclude Knowledge Pages"
+            },
+            "description": "Leave out the mental models that hold knowledge page content (list standalone models only)."
+          },
+          {
             "name": "authorization",
             "in": "header",
             "required": false,
@@ -2343,7 +2366,7 @@
           "Mental Models"
         ],
         "summary": "Refresh mental model",
-        "description": "Submit an async task to re-run the source query through reflect and update the content.",
+        "description": "Submit an async task to re-run the source query through reflect and update the content. With no body the refresh runs in the model's own `trigger.mode`. Send `{\"mode\": \"full\"}` for a full refresh: the content is regenerated from scratch this once (to clear the drift delta edits accumulate) while the stored trigger keeps its mode. Unlike clearing the model first, a full refresh that fails leaves the previous content in place.",
         "operationId": "refresh_mental_model",
         "parameters": [
           {
@@ -2381,6 +2404,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RefreshMentalModelRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3658,10 +3698,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')",
+              "description": "Case-insensitive substring filter on document ID or document text (e.g. 'report' matches 'report-2024' or any document containing 'report'). Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that. Matches are capped: past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend may match approximately; each item's `matched_fields` says what matched.",
               "title": "Q"
             },
-            "description": "Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')"
+            "description": "Case-insensitive substring filter on document ID or document text (e.g. 'report' matches 'report-2024' or any document containing 'report'). Meant for browsing and inspection, not for high-volume or latency-sensitive workloads \u2014 use recall for that. Matches are capped: past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend may match approximately; each item's `matched_fields` says what matched."
           },
           {
             "name": "tags",
@@ -3689,12 +3729,19 @@
             "in": "query",
             "required": false,
             "schema": {
+              "enum": [
+                "any",
+                "all",
+                "any_strict",
+                "all_strict",
+                "exact"
+              ],
               "type": "string",
-              "description": "How to match tags: 'any', 'all', 'any_strict', 'all_strict'",
+              "description": "How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'",
               "default": "any_strict",
               "title": "Tags Match"
             },
-            "description": "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+            "description": "How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'"
           },
           {
             "name": "time_field",
@@ -3915,6 +3962,101 @@
         }
       }
     },
+    "/v1/default/banks/{bank_id}/documents/{document_id}/history": {
+      "get": {
+        "tags": [
+          "Documents"
+        ],
+        "summary": "Get document change history",
+        "description": "What each change to a document did, newest first: every retain, append and reprocess (facts added and removed), every fact edit, invalidation, restore, delete, retag and per-fact observation clear (observations removed), and every consolidation run (observations created, updated and removed). Observations are rebuilt, not versioned, so this is the only record of the ones a change removed. Ids and counts only, with each id list capped at 100.\n\nRebuilt from the bank's async operations, which carry these events: it reaches back only as far as operations are kept (HINDSIGHT_API_OPERATION_RETENTION_DAYS, unlimited by default), and a change that ran without an operation is not in it \u2014 a synchronous retain (async=false), or a fact edit, delete or retag while auto-consolidation is off. A fact edit, delete or retag is recorded on the consolidation operation it queues. Clearing every observation in the bank is not listed. total, limit and offset count operations, not events.",
+        "operationId": "get_document_history",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "document_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Document Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "description": "Maximum number of operations to read",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Maximum number of operations to read"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Offset for pagination, in operations",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Offset for pagination, in operations"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentHistoryResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/default/banks/{bank_id}/documents/{document_id}/reprocess": {
       "post": {
         "tags": [
@@ -4055,7 +4197,7 @@
           "Documents"
         ],
         "summary": "Update document",
-        "description": "Update mutable fields on a document without re-processing its content.\n\n**Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them \u2014 send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).\n\nThe new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.\n\nAt least one field must be provided.",
+        "description": "Update mutable fields on a document without re-processing its content.\n\n**Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them \u2014 send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).\n\nThe new tags are propagated to all associated memory units.\n\n**Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.\n\nA memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.\n\nAt least one field must be provided.",
         "operationId": "update_document",
         "parameters": [
           {
@@ -4663,7 +4805,7 @@
           "Operations"
         ],
         "summary": "Retry a failed async operation",
-        "description": "Re-queue a failed async operation so the worker picks it up again",
+        "description": "Re-queue a failed or cancelled async operation so the worker picks it up again. On a deferred operation (pending with a future next_retry_at), runs it now.",
         "operationId": "retry_operation",
         "parameters": [
           {
@@ -7858,6 +8000,77 @@
         }
       }
     },
+    "/v1/default/banks/{bank_id}/audit-logs/{log_id}": {
+      "get": {
+        "tags": [
+          "Audit"
+        ],
+        "summary": "Get audit log entry",
+        "description": "Get one audit log entry with its full request and response bodies.",
+        "operationId": "get_audit_log",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "log_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Log Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditLogEntry"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bank or audit log entry not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/default/banks/{bank_id}/llm-requests": {
       "get": {
         "tags": [
@@ -7929,6 +8142,30 @@
               "title": "Scope"
             },
             "description": "Filter by call scope"
+          },
+          {
+            "name": "call_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "llm",
+                    "embedding",
+                    "rerank",
+                    "decision"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by kind of model call, told apart by scope: embedding (embedding_*), rerank, decision (decision_*), or llm (every other scope)",
+              "title": "Call Type"
+            },
+            "description": "Filter by kind of model call, told apart by scope: embedding (embedding_*), rerank, decision (decision_*), or llm (every other scope)"
           },
           {
             "name": "provider",
@@ -8158,6 +8395,30 @@
             "description": "Filter by operation"
           },
           {
+            "name": "call_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "llm",
+                    "embedding",
+                    "rerank",
+                    "decision"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by kind of model call: llm, embedding, rerank or decision",
+              "title": "Call Type"
+            },
+            "description": "Filter by kind of model call: llm, embedding, rerank or decision"
+          },
+          {
             "name": "period",
             "in": "query",
             "required": false,
@@ -8323,6 +8584,11 @@
             "title": "Duration Ms",
             "description": "Server-computed duration in milliseconds (started_at \u2192 ended_at). Null if not yet completed."
           },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
           "request": {
             "anyOf": [
               {
@@ -8346,11 +8612,6 @@
               }
             ],
             "title": "Response"
-          },
-          "metadata": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Metadata"
           }
         },
         "type": "object",
@@ -8361,12 +8622,12 @@
           "bank_id",
           "started_at",
           "ended_at",
+          "metadata",
           "request",
-          "response",
-          "metadata"
+          "response"
         ],
         "title": "AuditLogEntry",
-        "description": "A single audit log entry."
+        "description": "A single audit log entry with its full request/response bodies."
       },
       "AuditLogListResponse": {
         "properties": {
@@ -8388,10 +8649,11 @@
           },
           "items": {
             "items": {
-              "$ref": "#/components/schemas/AuditLogEntry"
+              "$ref": "#/components/schemas/AuditLogSummary"
             },
             "type": "array",
-            "title": "Items"
+            "title": "Items",
+            "description": "Entries without request/response bodies; fetch one entry by id for its bodies."
           }
         },
         "type": "object",
@@ -8468,6 +8730,84 @@
         ],
         "title": "AuditLogStatsResponse",
         "description": "Response model for audit log stats endpoint."
+      },
+      "AuditLogSummary": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport"
+          },
+          "bank_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bank Id"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms",
+            "description": "Server-computed duration in milliseconds (started_at \u2192 ended_at). Null if not yet completed."
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "action",
+          "transport",
+          "bank_id",
+          "started_at",
+          "ended_at",
+          "metadata"
+        ],
+        "title": "AuditLogSummary",
+        "description": "An audit log entry without its request/response bodies, as the list returns it."
       },
       "BackgroundResponse": {
         "properties": {
@@ -9194,6 +9534,42 @@
             "title": "Enable Reranking",
             "description": "Toggle cross-encoder reranking during recall"
           },
+          "reflect_use_decision_model": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reflect Use Decision Model",
+            "description": "When the server has a decision model, reflect lets it prune evidence and decide when to stop"
+          },
+          "mental_model_refresh_use_decision_model": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mental Model Refresh Use Decision Model",
+            "description": "The same, for knowledge-page refreshes"
+          },
+          "mental_model_delta_use_decision_model": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mental Model Delta Use Decision Model",
+            "description": "When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect"
+          },
           "disposition_skepticism": {
             "anyOf": [
               {
@@ -9390,6 +9766,33 @@
             ],
             "title": "Observation Scope Limits",
             "description": "DEPRECATED \u2014 use consolidation_strategies, which carries the mission too. Still honoured, but consulted only after consolidation_strategies. Per-scope overrides of max_observations_per_scope: [{\"scope\": [\"run_*\", \"shared\"], \"limit\": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope."
+          },
+          "default_observation_scopes": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "per_tag",
+                  "combined",
+                  "all_combinations",
+                  "shared"
+                ]
+              },
+              {
+                "items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Observation Scopes",
+            "description": "observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags."
           },
           "consolidation_strategies": {
             "anyOf": [
@@ -9614,6 +10017,18 @@
             "title": "Enable Auto Consolidation",
             "description": "Automatically consolidate observations after retain"
           },
+          "consolidation_use_decision_model": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consolidation Use Decision Model",
+            "description": "When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call"
+          },
           "consolidation_max_memories_per_round": {
             "anyOf": [
               {
@@ -9649,6 +10064,18 @@
             ],
             "title": "Recall Include Chunks",
             "description": "Include raw chunks in recall results"
+          },
+          "recall_prefer_observations": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Prefer Observations",
+            "description": "Default for recall prefer_observations when the request omits it"
           },
           "recall_max_tokens": {
             "anyOf": [
@@ -10551,7 +10978,7 @@
           "alias": {
             "type": "string",
             "title": "Alias",
-            "description": "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters), and it must not already name a bank or another alias."
+            "description": "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias."
           },
           "primary": {
             "type": "boolean",
@@ -11405,6 +11832,89 @@
           "skepticism": 3
         }
       },
+      "DocumentEvent": {
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "title": "Document Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DocumentEventKind"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id",
+            "description": "The operation this event was recorded on (filled in when read)."
+          },
+          "fact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fact Id",
+            "description": "The fact a fact_* event changed."
+          },
+          "facts_added": {
+            "type": "integer",
+            "title": "Facts Added",
+            "default": 0
+          },
+          "facts_removed": {
+            "type": "integer",
+            "title": "Facts Removed",
+            "default": 0
+          },
+          "observations_created": {
+            "$ref": "#/components/schemas/ObservationIdSample"
+          },
+          "observations_updated": {
+            "$ref": "#/components/schemas/ObservationIdSample"
+          },
+          "observations_removed": {
+            "$ref": "#/components/schemas/ObservationIdSample"
+          }
+        },
+        "type": "object",
+        "required": [
+          "document_id",
+          "kind"
+        ],
+        "title": "DocumentEvent",
+        "description": "One change to a document, and its effect on the facts and observations built from it."
+      },
+      "DocumentEventKind": {
+        "type": "string",
+        "enum": [
+          "retain",
+          "append",
+          "reprocess",
+          "retag",
+          "fact_edited",
+          "fact_invalidated",
+          "fact_restored",
+          "fact_deleted",
+          "observations_cleared",
+          "consolidation"
+        ],
+        "title": "DocumentEventKind",
+        "description": "What a change was. A named enum, not a Literal: inline enums are named after their field by\nthe generated Rust client, and ``kind`` already names the knowledge-base node enum there."
+      },
       "DocumentExportSubmitResponse": {
         "properties": {
           "operation_id": {
@@ -11423,6 +11933,43 @@
         ],
         "title": "DocumentExportSubmitResponse",
         "description": "Response for the async document-export endpoint (202).\n\nThe export runs in the background; poll the operations endpoint for status.\nOn completion the operation's ``result_metadata`` carries ``download_url``\n(fetch the ZIP from GET /v1/default/files/download/{key}), ``storage_key``,\n``byte_size``, and ``filename``."
+      },
+      "DocumentHistoryResponse": {
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "title": "Document Id"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DocumentEvent"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "document_id",
+          "total",
+          "limit",
+          "offset",
+          "items"
+        ],
+        "title": "DocumentHistoryResponse",
+        "description": "A document's change history, newest first. ``total``, ``limit`` and ``offset`` count operations:\none operation can carry several events for the same document (an oversized retain in slices)."
       },
       "DocumentImportSubmitResponse": {
         "properties": {
@@ -11525,6 +12072,19 @@
             "type": "array",
             "title": "Tags",
             "description": "Tags associated with this document",
+            "default": []
+          },
+          "matched_fields": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "id",
+                "original_text"
+              ]
+            },
+            "type": "array",
+            "title": "Matched Fields",
+            "description": "Which fields matched the `q` search: 'id', 'original_text', or both. Empty when no `q` is given.",
             "default": []
           }
         },
@@ -12908,7 +13468,7 @@
                 "type": "null"
               }
             ],
-            "description": "Pages only: the page's refresh settings \u2014 when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored."
+            "description": "Pages only: the page's refresh settings \u2014 when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored."
           },
           "children": {
             "items": {
@@ -13735,6 +14295,12 @@
           "offset": {
             "type": "integer",
             "title": "Offset"
+          },
+          "total_is_estimate": {
+            "type": "boolean",
+            "title": "Total Is Estimate",
+            "description": "True when a `q` search stopped at its match cap, so `total` is a lower bound rather than an exact count. Always false without `q`.",
+            "default": false
           }
         },
         "type": "object",
@@ -14499,7 +15065,7 @@
               }
             ],
             "title": "ObservationScopes",
-            "description": "How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags \u2014 useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use."
+            "description": "How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags \u2014 useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use. An entry containing '*' is a glob matched against the memory's own tags \u2014 e.g. [['topic:*', 'user:*']] scopes by the memory's topic and user tags (including tags added by entity labels at retain) and ignores the rest; a scope whose globs match nothing is skipped. When omitted, the bank's default_observation_scopes applies ('combined' unless configured)."
           },
           "strategy": {
             "anyOf": [
@@ -15452,7 +16018,19 @@
               }
             ],
             "title": "Last Refresh Failed At",
-            "description": "When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`) skip the model \u2014 a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history."
+            "description": "When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip the model \u2014 a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history."
+          },
+          "last_full_refreshed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Full Refreshed At",
+            "description": "When a refresh last ran in full mode for this model, in ISO format \u2014 requested (`mode: 'full'`, a `full_refresh_cron` tick, a full-mode model) or fallen back to by a delta refresh. `trigger.full_refresh_cron` comes due against this, not `last_refreshed_at`, which every delta refresh moves. Null when no full refresh has completed since this was first tracked."
           },
           "created_at": {
             "anyOf": [
@@ -15464,6 +16042,18 @@
               }
             ],
             "title": "Created At"
+          },
+          "is_knowledge_page": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Knowledge Page",
+            "description": "True when this model holds a knowledge page's content rather than being a standalone mental model. Set by the list and get endpoints."
           },
           "reflect_response": {
             "anyOf": [
@@ -15667,6 +16257,18 @@
             "title": "Refresh Cron",
             "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule."
           },
+          "full_refresh_cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Refresh Cron",
+            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` \u2014 a delta model can refresh after consolidation and still get a weekly full refresh \u2014 and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule."
+          },
           "min_refresh_interval_seconds": {
             "anyOf": [
               {
@@ -15678,7 +16280,7 @@
               }
             ],
             "title": "Min Refresh Interval Seconds",
-            "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor)."
+            "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor)."
           },
           "fact_types": {
             "anyOf": [
@@ -15894,6 +16496,18 @@
             "title": "Refresh Cron",
             "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule."
           },
+          "full_refresh_cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Refresh Cron",
+            "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` \u2014 a delta model can refresh after consolidation and still get a weekly full refresh \u2014 and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule."
+          },
           "min_refresh_interval_seconds": {
             "anyOf": [
               {
@@ -15905,7 +16519,7 @@
               }
             ],
             "title": "Min Refresh Interval Seconds",
-            "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor)."
+            "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor)."
           },
           "fact_types": {
             "anyOf": [
@@ -16134,6 +16748,25 @@
         "type": "object",
         "title": "MinScores",
         "description": "Optional per-stage score floors for recall. Every floor is inclusive (``>=``).\n\nThe four floors act at two different levels, and the distinction decides what a\nreturned result is guaranteed to satisfy.\n\n``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into their own\nSQL arm (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``\nconfig for this request), so they prune weak matches before fusion. Each one\nconstrains **only the arm it names**. Recall fuses four arms \u2014 semantic, keyword,\ngraph and temporal \u2014 and a result reaches the response if *any* arm surfaced it,\nso a returned result may legitimately carry ``null`` for a stage it was not\nsurfaced by, and results reached through the graph or temporal arm carry neither\n``semantic`` nor ``keyword``. A *non-null* score always clears its floor \u2014 the\ngap is only ever a ``null``. Setting both does **not** restrict the response to\nresults that clear both: they are not a predicate over each fused result. This is\ndeliberate \u2014 an intersection would discard the strong single-arm matches that\nhybrid retrieval exists to find (a paraphrase with no lexical overlap, an exact\nidentifier the embedding scores poorly).\n\n``reranker`` and ``final`` are **post-query** filters applied to every scored\nresult after fusion and reranking, so these *are* per-result predicates: a\nreturned result always clears them. Use them, not the retrieval floors, to make\nrecall abstain on low-confidence queries.\n\nAny field left None imposes no floor; all-None (the default) means no score\nfiltering."
+      },
+      "ObservationIdSample": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ids"
+          }
+        },
+        "type": "object",
+        "title": "ObservationIdSample",
+        "description": "How many observations an event touched, and (up to ``MAX_IDS``) which."
       },
       "ObservationScope": {
         "properties": {
@@ -16957,10 +17590,16 @@
             "description": "List of fact types to recall: 'world', 'experience', 'observation'. Defaults to all fact types if not specified."
           },
           "prefer_observations": {
-            "type": "boolean",
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Prefer Observations",
-            "description": "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. Disabled by default; set to true to enable. No effect unless 'observation' and at least one raw type are both requested.",
-            "default": false
+            "description": "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested."
           },
           "budget": {
             "$ref": "#/components/schemas/Budget",
@@ -18260,6 +18899,26 @@
         "title": "RefreshMentalModelOperationDetails",
         "description": "What a refresh_mental_model operation did, on the operation record itself.\n\nReported under an async operation's ``details``, which is keyed by\n``operation_type``: each type that has a typed outcome to report contributes\nits own shape there, rather than every type's fields being flattened onto the\noperation. Today refresh is the only one.\n\nThis exists because ``result_metadata`` \u2014 the only per-refresh record kept\nindefinitely \u2014 could not say what a refresh did (#3274), and is documented as\ndebug-only and unstable, so it is not something a caller can build on."
       },
+      "RefreshMentalModelRequest": {
+        "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "full"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode",
+            "description": "'full' regenerates the content from scratch for this refresh only, whatever `trigger.mode` says; the stored trigger is not changed. null runs the model's own mode."
+          }
+        },
+        "type": "object",
+        "title": "RefreshMentalModelRequest",
+        "description": "Optional body of POST /mental-models/{id}/refresh."
+      },
       "ReprocessDocumentResponse": {
         "properties": {
           "success": {
@@ -19069,6 +19728,33 @@
             ],
             "title": "Tags",
             "description": "The complete new set of tags for the document and its memory units \u2014 this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation."
+          },
+          "observation_scopes": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "per_tag",
+                  "combined",
+                  "all_combinations",
+                  "shared"
+                ]
+              },
+              {
+                "items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "UpdateDocumentObservationScopes",
+            "description": "New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to scope by each memory's full tag set). Use it to move memories retained under one scoping to another \u2014 e.g. per-session documents to 'shared' \u2014 without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses."
           }
         },
         "type": "object",
@@ -19142,6 +19828,18 @@
             ],
             "title": "Occurred End",
             "description": "New occurred-range end (ISO 8601). '' clears it; omit to leave unchanged."
+          },
+          "mentioned_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mentioned At",
+            "description": "New mention time \u2014 when the fact was said or written (ISO 8601). '' clears it; omit to leave unchanged."
           },
           "fact_type": {
             "anyOf": [
@@ -19547,6 +20245,17 @@
           "id": {
             "type": "string",
             "title": "Id"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
           },
           "webhook_id": {
             "anyOf": [

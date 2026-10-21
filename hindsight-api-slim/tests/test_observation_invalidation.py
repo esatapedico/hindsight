@@ -127,7 +127,9 @@ async def _get_observation_ids(conn, bank_id: str) -> list[str]:
 
 
 async def _get_consolidated_at(conn, memory_id: uuid.UUID, bank_id: str | None = None):
-    """A memory's consolidated marker. ``bank_id`` is required for a bank-partitioned store."""
+    """A memory's consolidated marker. ``bank_id`` is required for a bank-partitioned store.
+
+    Read directly because the marker is scheduler state the public read API does not expose."""
     store = get_memories()
     if not store.store_owned:
         return await conn.fetchval(
@@ -712,8 +714,8 @@ class TestClearObservationsForMemory:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_no_observations_returns_zero(self, memory: MemoryEngine, request_context: RequestContext):
-        """Returns 0 when the memory has no associated observations."""
+    async def test_no_observations_still_resets_memory(self, memory: MemoryEngine, request_context: RequestContext):
+        """With no observations to delete, the memory is still reset and re-consolidation queued (#5731)."""
         bank_id = f"test-clear-obs-noop-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
 
@@ -721,13 +723,38 @@ class TestClearObservationsForMemory:
         async with pool.acquire() as conn:
             m1 = await _insert_memory(memory, conn, bank_id, "Alice loves hiking.")
 
-        result = await memory.clear_observations_for_memory(bank_id, str(m1), request_context=request_context)
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as submit:
+            result = await memory.clear_observations_for_memory(bank_id, str(m1), request_context=request_context)
 
         assert result["deleted_count"] == 0
+        submit.assert_awaited_once()
 
         async with pool.acquire() as conn:
-            # Memory should still be consolidated (no observations were cleared)
-            assert await _get_consolidated_at(conn, m1, bank_id) is not None
+            assert await _get_consolidated_at(conn, m1, bank_id) is None
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_http_clear_with_no_observations_resets_memory(
+        self, memory: MemoryEngine, api_client, request_context: RequestContext
+    ):
+        """The documented route resets the memory even when it had no observations (#5731)."""
+        bank_id = f"test-clear-obs-http-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(memory, conn, bank_id, "Alice loves hiking.")
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as submit:
+            resp = await api_client.delete(f"/v1/default/banks/{bank_id}/memories/{m1}/observations")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted_count": 0}
+        submit.assert_awaited_once()
+
+        async with pool.acquire() as conn:
+            assert await _get_consolidated_at(conn, m1, bank_id) is None
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -966,22 +993,30 @@ class TestUpdateDocumentTagsObservationCleanup:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_update_tags_no_consolidation_when_no_observations(
+    async def test_update_tags_requeues_moved_memories_without_observations(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        """submit_async_consolidation is NOT called when no observations are invalidated."""
+        """A retag that moves a memory's scope requeues it and submits consolidation even when no
+        observation was built on it: it was consolidated under a scope it no longer writes to,
+        and has never been tried in the new one (#5309). This used to submit nothing."""
         bank_id = f"test-tag-update-nocons-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
 
         pool = await memory._get_pool()
         async with pool.acquire() as conn:
             doc_id = f"doc-{uuid.uuid4().hex[:8]}"
-            await _insert_document_with_memories(memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")])
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
             # No observations inserted
 
         with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
             await memory.update_document(doc_id, bank_id, tags=["new-tag"], request_context=request_context)
-            mock_consolidate.assert_not_awaited()
+            mock_consolidate.assert_awaited_once()
+
+        async with pool.acquire() as conn:
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is None
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -1049,11 +1084,19 @@ class TestUpdateDocumentTagsObservationCleanup:
                 doc_id, bank_id, tags=["kind:handoff", "pickup"], request_context=request_context
             )
 
-        # Rebuild the observation the way consolidation would have, then re-send the
-        # SAME tags.
+        # Rebuild the observation the way consolidation would have — including marking the
+        # document's memories consolidated again, which the first PATCH requeued — then re-send
+        # the SAME tags.
         async with pool.acquire() as conn:
             obs_id = await _insert_observation(
                 memory, conn, bank_id, "Alice loves outdoor activities.", doc_mem_ids + [other_mem]
+            )
+            await get_memories().mark_consolidated(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_ids=[str(m) for m in doc_mem_ids],
+                when=datetime.now(timezone.utc),
             )
             assert await _get_consolidated_at(conn, other_mem, bank_id) is not None
 

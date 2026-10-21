@@ -17,7 +17,18 @@ import pytest
 from hindsight_api.api.http import MentalModelTrigger
 from hindsight_api.engine.llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
 from hindsight_api.engine.maintenance import MaintenanceLoop
+from hindsight_api.engine.memories import get_memories
 from hindsight_api.engine.memory_engine import MemoryEngine
+from tests.store_seed import store_write_facts
+
+
+def test_full_refresh_cron_combines_with_either_trigger():
+    """full_refresh_cron is a second schedule, not a third exclusive trigger."""
+    MentalModelTrigger(mode="delta", refresh_after_consolidation=True, full_refresh_cron="0 3 * * 0")
+    MentalModelTrigger(mode="delta", refresh_cron="0 * * * *", full_refresh_cron="0 3 * * 0")
+    assert MentalModelTrigger(full_refresh_cron="  ").full_refresh_cron is None
+    with pytest.raises(ValueError, match="full_refresh_cron is not a valid cron expression"):
+        MentalModelTrigger(full_refresh_cron="every sunday")
 
 
 def test_refresh_cron_and_auto_refresh_are_mutually_exclusive():
@@ -43,19 +54,26 @@ async def _insert_mm(
     refresh_cron: str | None,
     last_refreshed_offset: str,
     tags: list[str] | None = None,
+    full_refresh_cron: str | None = None,
+    last_full_refreshed_offset: str | None = None,
 ) -> str:
     """Insert a pinned mental model. ``last_refreshed_offset`` is an interval
-    string applied as ``now() - INTERVAL <offset>`` (e.g. '1 day', '0 seconds')."""
+    string applied as ``now() - INTERVAL <offset>`` (e.g. '1 day', '0 seconds');
+    ``last_full_refreshed_offset`` likewise, None leaving the column null."""
     mm_id = f"mm-{uuid.uuid4().hex}"
     trigger = {"refresh_after_consolidation": False}
     if refresh_cron is not None:
         trigger["refresh_cron"] = refresh_cron
+    if full_refresh_cron is not None:
+        trigger["full_refresh_cron"] = full_refresh_cron
+    last_full = f"now() - INTERVAL '{last_full_refreshed_offset}'" if last_full_refreshed_offset else "NULL"
     await conn.execute(
         f"""
         INSERT INTO mental_models
-          (id, bank_id, subtype, name, source_query, content, tags, trigger, last_refreshed_at)
+          (id, bank_id, subtype, name, source_query, content, tags, trigger, last_refreshed_at,
+           last_full_refreshed_at)
         VALUES ($1, $2, 'pinned', 'sched model', 'what changed', 'body', $3, $4::jsonb,
-                now() - INTERVAL '{last_refreshed_offset}')
+                now() - INTERVAL '{last_refreshed_offset}', {last_full})
         """,
         mm_id,
         bank_id,
@@ -65,21 +83,35 @@ async def _insert_mm(
     return mm_id
 
 
-async def _insert_fact(conn, bank_id: str, tags: list[str] | None = None) -> None:
-    await conn.execute(
-        "INSERT INTO memory_units (id, bank_id, text, fact_type, tags, created_at, updated_at) "
-        "VALUES ($1, $2, 'a fresh fact', 'experience', $3, now(), now())",
-        uuid.uuid4(),
-        bank_id,
-        tags or [],
-    )
+async def _new_fact(memory: MemoryEngine, bank_id: str) -> None:
+    """A fact newer than the model's last refresh, written where the bank's memories live.
+
+    Written directly rather than retained: a retain also runs consolidation, which refreshes
+    or re-dates the very model these tests are timing.
+    """
+    if get_memories().store_owned_for(bank_id):
+        await store_write_facts(memory, bank_id, [str(uuid.uuid4())], ["a fresh fact"], fact_type="experience")
+        return
+    async with memory._pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO memory_units (id, bank_id, text, fact_type, tags, created_at, updated_at) "
+            "VALUES ($1, $2, 'a fresh fact', 'experience', $3, now(), now())",
+            uuid.uuid4(),
+            bank_id,
+            [],
+        )
 
 
-def _patch_submit(memory: MemoryEngine, monkeypatch) -> list[str]:
+def _patch_submit(memory: MemoryEngine, monkeypatch, modes: dict[str, str | None] | None = None) -> list[str]:
+    """Record submitted model ids; when ``modes`` is given, also each submit's ``mode``."""
     submitted: list[str] = []
 
-    async def _record(*, bank_id, mental_model_id, request_context, skip_if_in_flight=False, automatic=False):
+    async def _record(
+        *, bank_id, mental_model_id, request_context, skip_if_in_flight=False, automatic=False, mode=None
+    ):
         submitted.append(mental_model_id)
+        if modes is not None:
+            modes[mental_model_id] = mode
         return {"operation_id": str(uuid.uuid4())}
 
     monkeypatch.setattr(memory, "submit_async_refresh_mental_model", _record)
@@ -195,13 +227,12 @@ async def test_routine_returns_cron_models_excludes_plain_and_in_flight(memory: 
 
 
 @pytest.mark.asyncio
-@pytest.mark.memory_backend_incompatible
 async def test_due_and_stale_model_is_refreshed(memory: MemoryEngine, request_context, monkeypatch):
     """A model whose cron is due and that has new memories in scope is refreshed."""
     bank = await _make_bank(memory, request_context)
     async with memory._pool.acquire() as conn:
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
-        await _insert_fact(conn, bank)  # newer than last_refreshed_at -> stale
+    await _new_fact(memory, bank)  # newer than last_refreshed_at -> stale
 
     submitted = _patch_submit(memory, monkeypatch)
     await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
@@ -210,7 +241,6 @@ async def test_due_and_stale_model_is_refreshed(memory: MemoryEngine, request_co
 
 
 @pytest.mark.asyncio
-@pytest.mark.memory_backend_incompatible
 async def test_scheduled_refresh_is_marked_automatic(memory: MemoryEngine, request_context, monkeypatch):
     """A cron refresh is subject to the minimum-interval floor.
 
@@ -222,11 +252,13 @@ async def test_scheduled_refresh_is_marked_automatic(memory: MemoryEngine, reque
     bank = await _make_bank(memory, request_context)
     async with memory._pool.acquire() as conn:
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
-        await _insert_fact(conn, bank)
+    await _new_fact(memory, bank)
 
     recorded: dict[str, bool] = {}
 
-    async def _record(*, bank_id, mental_model_id, request_context, skip_if_in_flight=False, automatic=False):
+    async def _record(
+        *, bank_id, mental_model_id, request_context, skip_if_in_flight=False, automatic=False, mode=None
+    ):
         recorded[mental_model_id] = automatic
         return {"operation_id": str(uuid.uuid4())}
 
@@ -322,7 +354,7 @@ async def test_not_due_model_is_skipped_even_when_stale(memory: MemoryEngine, re
         # Yearly cron (Jan 1); last refresh seconds ago -> the most recent fire is
         # well before last_refreshed_at, so it is not due.
         mm_id = await _insert_mm(conn, bank, refresh_cron="0 0 1 1 *", last_refreshed_offset="5 seconds")
-        await _insert_fact(conn, bank)  # stale, but cron not due
+    await _new_fact(memory, bank)  # stale, but cron not due
 
     submitted = _patch_submit(memory, monkeypatch)
     await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
@@ -341,7 +373,7 @@ async def test_failed_model_is_not_requeued_until_a_refresh_succeeds(
     bank = await _make_bank(memory, request_context)
     async with memory._pool.acquire() as conn:
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
-        await _insert_fact(conn, bank)
+    await _new_fact(memory, bank)
     _stall_worker(memory, monkeypatch)
     await memory._record_mental_model_refresh_failure(
         bank, mm_id, outcome="refresh_failed_error", failure_reason="unexpected_error", error_message="boom"
@@ -387,7 +419,7 @@ async def test_a_temporary_provider_failure_does_not_pause_automatic_refresh(
     bank = await _make_bank(memory, request_context)
     async with memory._pool.acquire() as conn:
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
-        await _insert_fact(conn, bank)
+    await _new_fact(memory, bank)
 
     async def _fail(**kwargs):
         raise error
@@ -427,10 +459,40 @@ async def test_refresh_cut_off_by_the_wall_timeout_counts_as_failed(memory: Memo
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
 
     await memory.on_task_wall_timeout(
-        {"type": "refresh_mental_model", "bank_id": bank, "mental_model_id": mm_id}, None, "timed out"
+        {"type": "refresh_mental_model", "bank_id": bank, "mental_model_id": mm_id},
+        None,
+        "timed out",
+        "llm.codex.tools.attempt=1/2",
     )
 
     assert await memory._automatic_refresh_paused(bank, mm_id) is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_cut_off_during_a_retry_backoff_does_not_pause(
+    memory: MemoryEngine, request_context, monkeypatch
+):
+    """#5561: a provider outage left the refresh sleeping out a retry backoff when the
+    ceiling fired, and the page stayed paused for days after the provider came back.
+    The failure is still recorded in history, but the next automatic trigger runs."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+    await _new_fact(memory, bank)
+
+    await memory.on_task_wall_timeout(
+        {"type": "refresh_mental_model", "bank_id": bank, "mental_model_id": mm_id},
+        None,
+        "timed out",
+        "llm.codex.tools.attempt=1/2.backoff",
+    )
+
+    assert await memory._automatic_refresh_paused(bank, mm_id) is False
+    history = await memory.get_mental_model_history(bank, mm_id, request_context=request_context)
+    assert [h["kind"] for h in history] == ["refresh_failed"]
+    _stall_worker(memory, monkeypatch)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+    assert await _count_refresh_ops(memory, bank) == 1
 
 
 @pytest.mark.asyncio
@@ -453,3 +515,171 @@ async def test_the_failure_is_visible_on_the_model_and_cleared_by_a_success(memo
     refreshed = await memory.get_mental_model(bank, mm_id, request_context=request_context)
     assert refreshed["last_refresh_failed_at"] is None
     assert await memory._automatic_refresh_paused(bank, mm_id) is False
+
+
+# ── scheduled full refresh (trigger.full_refresh_cron, #4340) ────────────────
+
+
+@pytest.mark.asyncio
+async def test_routine_returns_models_with_only_a_full_refresh_cron(memory: MemoryEngine, request_context):
+    """A delta model on refresh-after-consolidation has no refresh_cron, but its
+    full_refresh_cron must still be discovered, with the clock it comes due against."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron=None,
+            last_refreshed_offset="1 hour",
+            full_refresh_cron="0 3 * * 0",
+            last_full_refreshed_offset="3 days",
+        )
+        rows = await conn.fetch("SELECT * FROM public.mental_models_with_cron() WHERE bank_id = $1", bank)
+
+    assert [r["mental_model_id"] for r in rows] == [mm_id]
+    assert rows[0]["refresh_cron"] is None
+    assert rows[0]["full_refresh_cron"] == "0 3 * * 0"
+    assert rows[0]["last_full_refreshed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_due_full_refresh_is_submitted_in_full_mode_even_when_not_stale(
+    memory: MemoryEngine, request_context, monkeypatch
+):
+    """The full refresh exists to clear drift past deltas left, which a bank with no
+    new memories still carries — so it is not gated on staleness, and it is submitted
+    with mode='full'."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        # Every-5-minutes full refresh last ran a day ago; a delta ran an hour ago.
+        mm_id = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron=None,
+            last_refreshed_offset="1 hour",
+            full_refresh_cron="*/5 * * * *",
+            last_full_refreshed_offset="1 day",
+        )
+
+    modes: dict[str, str | None] = {}
+    submitted = _patch_submit(memory, monkeypatch, modes)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    # Other tests' models share the database, so only this model's submits are checked.
+    assert submitted.count(mm_id) == 1
+    assert modes[mm_id] == "full"
+
+
+@pytest.mark.asyncio
+async def test_full_refresh_is_skipped_when_nothing_refreshed_since_the_last_one(
+    memory: MemoryEngine, request_context, monkeypatch
+):
+    """No refresh since the last full one means no drift to clear."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron=None,
+            last_refreshed_offset="1 day",
+            full_refresh_cron="*/5 * * * *",
+            last_full_refreshed_offset="1 day",
+        )
+
+    submitted = _patch_submit(memory, monkeypatch)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    assert mm_id not in submitted
+
+
+@pytest.mark.asyncio
+async def test_full_refresh_comes_due_against_its_own_clock(memory: MemoryEngine, request_context, monkeypatch):
+    """A recent delta refresh does not push the full refresh back, and a recent full
+    refresh keeps a not-yet-fired yearly schedule quiet."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        # Delta 5 seconds ago — if due-ness keyed off last_refreshed_at this would never fire.
+        due_mm = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron=None,
+            last_refreshed_offset="5 seconds",
+            full_refresh_cron="*/5 * * * *",
+            last_full_refreshed_offset="1 day",
+        )
+        # Yearly full refresh that last ran seconds ago: not due.
+        quiet_mm = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron=None,
+            last_refreshed_offset="1 second",
+            full_refresh_cron="0 0 1 1 *",
+            last_full_refreshed_offset="5 seconds",
+        )
+
+    submitted = _patch_submit(memory, monkeypatch)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    assert due_mm in submitted
+    assert quiet_mm not in submitted
+
+
+@pytest.mark.asyncio
+async def test_when_both_schedules_are_due_the_full_refresh_wins(memory: MemoryEngine, request_context, monkeypatch):
+    """One submit, in full mode: it covers what the plain refresh would have done."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(
+            conn,
+            bank,
+            refresh_cron="*/5 * * * *",
+            last_refreshed_offset="1 hour",
+            full_refresh_cron="*/5 * * * *",
+            last_full_refreshed_offset="1 day",
+        )
+    await _new_fact(memory, bank)
+
+    modes: dict[str, str | None] = {}
+    submitted = _patch_submit(memory, monkeypatch, modes)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    # Other tests' models share the database, so only this model's submits are checked.
+    assert submitted.count(mm_id) == 1
+    assert modes[mm_id] == "full"
+
+
+async def _queued_payload(memory: MemoryEngine, operation_id: str) -> dict:
+    # Raw read: the task payload is internal to the queue and no engine method exposes it,
+    # and the payload's mode is exactly what the fold is supposed to change.
+    async with memory._pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT task_payload FROM async_operations WHERE operation_id = $1", uuid.UUID(operation_id)
+        )
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+@pytest.mark.asyncio
+async def test_a_full_refresh_folded_into_a_queued_one_upgrades_it(memory: MemoryEngine, request_context, monkeypatch):
+    """Dedupe keeps one queued refresh per model; a full submit that folds into a queued
+    plain one must make that one full, or its 'full' is silently dropped. A plain submit
+    folding into a queued full one leaves it full."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(conn, bank, refresh_cron=None, last_refreshed_offset="1 day")
+    _stall_worker(memory, monkeypatch)
+
+    plain = await memory.submit_async_refresh_mental_model(
+        bank_id=bank, mental_model_id=mm_id, request_context=request_context
+    )
+    assert "_mode" not in await _queued_payload(memory, plain["operation_id"])
+
+    full = await memory.submit_async_refresh_mental_model(
+        bank_id=bank, mental_model_id=mm_id, request_context=request_context, mode="full"
+    )
+    assert full["deduplicated"] is True
+    assert full["operation_id"] == plain["operation_id"]
+    assert (await _queued_payload(memory, plain["operation_id"]))["_mode"] == "full"
+
+    await memory.submit_async_refresh_mental_model(bank_id=bank, mental_model_id=mm_id, request_context=request_context)
+    assert (await _queued_payload(memory, plain["operation_id"]))["_mode"] == "full"
+    assert await _count_refresh_ops(memory, bank) == 1

@@ -255,6 +255,16 @@ class DocumentTags:
     tags: list[str] | None
 
 
+def _tag_filter_kwargs(tags: list[str] | None, tags_match: TagsMatch, tag_groups: list | None) -> dict[str, Any]:
+    """The tag-filter kwargs a default forwards to an overridable store seam — none when the
+    filter is inactive. A store whose seam predates the tag kwargs keeps working unfiltered,
+    and one asked to filter but unable to still fails loudly (``TypeError``) instead of
+    silently returning out-of-scope rows."""
+    if not tag_filter_active(tags, tags_match, tag_groups):
+        return {}
+    return {"tags": tags, "tags_match": tags_match, "tag_groups": tag_groups}
+
+
 def _epoch_ms_to_datetime(value: Any) -> datetime | None:
     """Epoch milliseconds -> aware datetime, for records read from a store rather than from SQL.
 
@@ -785,6 +795,13 @@ class RecallArms:
 #: How many semantic hits seed the graph arm's link expansion — its entry points into the graph.
 GRAPH_SEED_LIMIT = 20
 
+#: Most edges of each kind one graph-view answer carries: the links a store reads (with the ones
+#: observations inherit from them), and the edges the engine derives (shared source, shared
+#: entity) -- so at most twice this in all. The UI cannot usefully draw more, and uncapped a bank
+#: of a few thousand observations derives hundreds of thousands -- seconds of Python on the event
+#: loop and a multi-MB answer (#5703).
+GRAPH_MAX_EDGES = 10_000
+
 
 @dataclass
 class SemanticBm25Result:
@@ -838,6 +855,11 @@ class FullRecallRequest:
     #: ``"rrf"``, ``"interleave"`` or ``"cross_encoder"`` — the engine's ``reranking`` mode. The
     #: first two are passthrough (the fusion order stands); only the third calls a reranker.
     reranking: str = "rrf"
+    #: The engine's reranker for ``"cross_encoder"``, by provider name (``"local"``, ``"tei"``,
+    #: ``"typesafe"``, ``"decision_model"``, ...). A store that reranks with a cross-encoder of its
+    #: own answers for a pointwise cross-encoder only, and declines a provider in
+    #: ``RANK_SCORE_PROVIDERS``: those judge the pool as a whole, and their order is final.
+    reranker_provider: str = ""
     reranker_max_candidates: int = 0
     per_source_cap: int = 0
     #: Arm name -> priority level, from ``HINDSIGHT_API_RECALL_STRATEGY_BOOSTS``.
@@ -1018,6 +1040,16 @@ class RelabelResult:
 
     updated: int
     rescoped_unit_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RetagResult:
+    """What retagging or rescoping a document's memories did: how many observations it deleted,
+    and how many memories it queued again for consolidation because their observation scopes
+    moved. Both zero when nothing moved."""
+
+    invalidated_observations: int = 0
+    requeued_units: int = 0
 
 
 class EntityResolverHandle(Protocol):
@@ -1355,7 +1387,12 @@ class MemoriesExtension(Extension, ABC):
         """Release resources. Called during engine shutdown."""
 
     async def ensure_bank_storage(self, bank_id: str) -> None:
-        """Ensure per-bank storage exists. Idempotent."""
+        """Ensure per-bank storage exists. Idempotent.
+
+        Called BEFORE the bank row is written (bank creation and bank import), so it must not
+        require the row to exist. A failed create can leave storage behind with no row; the next
+        call for that bank must adopt it.
+        """
 
     def allocate_unit_ids(self, count: int) -> list[str]:
         """Mint unit ids for a batch about to be written.
@@ -1504,7 +1541,12 @@ class MemoriesExtension(Extension, ABC):
 
         ``time_field`` (``created_at`` / ``updated_at``) with ``start_date``/``end_date`` is the
         same window the SQL branch applies: half-open ``[start, end)`` on the named axis, which also
-        becomes the ordering. ``total`` counts the window, on the same terms as tags above."""
+        becomes the ordering. ``total`` counts the window, on the same terms as tags above.
+
+        ``search_query`` is a browse search, not retrieval: a store may answer it approximately and
+        from a bounded set of matches, but each row's ``matched_fields`` must say why it matched
+        (``id``, ``original_text``), and when the bound cut the matches short the result carries
+        ``total_is_estimate: True`` so ``total`` is not read as exact."""
         raise NotImplementedError
 
     async def count_documents(self, *, bank_id: str) -> int:
@@ -1707,6 +1749,18 @@ class MemoriesExtension(Extension, ABC):
         Without it, `update_document(tags=...)` changed the memories' tags and left the document
         itself showing the old ones, which is the sort of half-applied edit that only surfaces in
         the browser a week later."""
+        raise NotImplementedError
+
+    async def set_document_observation_scopes(
+        self, *, bank_id: str, document_id: str, observation_scopes: "list | str"
+    ) -> None:
+        """Replace the ``observation_scopes`` a document RECORD's retain params carry, leaving its
+        bodies and the rest of its params alone.
+
+        Only a ``store_owned`` store is asked, for the same reason as :meth:`set_document_tags`.
+        Without it, moving a document to another scoping (#5309) would hold only until the next
+        reprocess, which retains with the params on the record. Default: unsupported — the
+        engine refuses the change (400) before writing anything."""
         raise NotImplementedError
 
     async def set_document_file(
@@ -2109,6 +2163,28 @@ class MemoriesExtension(Extension, ABC):
         with nothing to read, which is silent rather than wrong-looking.
         """
 
+    async def memories_updated_between(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        until: datetime,
+        since: datetime,
+        limit: int,
+        fact_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list | None = None,
+    ) -> list[StoredMemory] | None:
+        """The memories in :meth:`newest_memory_updated_at`'s scope and window, oldest first.
+
+        A delta knowledge-page refresh reads them to ask a decision model which could
+        change the page, instead of searching for them. None means this store cannot
+        list them, and the refresh searches as it always has.
+        """
+        return None
+
     async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
         """The newest ``updated_at`` across the bank's memories, or None if it has none.
 
@@ -2376,7 +2452,7 @@ class MemoriesExtension(Extension, ABC):
     ) -> None:
         """Apply a curation field edit to a live memory.
 
-        Writes the new text / context / fact_type / occurred window, resets the
+        Writes the new text / context / fact_type / occurred window / mention time, resets the
         consolidation markers (the memory re-consolidates) and stamps the edit
         time, and drops the memory's derived links (they are recomputed).
 
@@ -2512,9 +2588,7 @@ class MemoriesExtension(Extension, ABC):
             search_query=search_query,
             document_id=document_id,
             chunk_id=chunk_id,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
+            **_tag_filter_kwargs(tags, tags_match, tag_groups),
             limit=limit,
         )
         units = page["units"]
@@ -2559,6 +2633,10 @@ class MemoriesExtension(Extension, ABC):
         Returns how many observations were removed. Called whenever facts are
         replaced or deleted, so an observation never outlives the facts it
         summarises; sources that survive go back in the consolidation queue.
+
+        Pass what was removed to ``document_history.note_observations_removed``
+        before returning: the rows are gone for good, and the document change
+        history is the only place their ids survive (#5638).
         """
 
     # ------------------------------------------------------------------ maintenance
@@ -2944,16 +3022,31 @@ class MemoriesExtension(Extension, ABC):
         return {did: list(rec["tags"] or []) for did, rec in records.items() if "tags" in rec}
 
     async def update_document_tags(
-        self, *, conn, fq_table, bank_id: str, document_id: str, tags: list[str] | None, found: bool
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        document_id: str,
+        tags: list[str] | None,
+        found: bool,
+        observation_scopes: list | str | None = None,
     ) -> bool:
         """Mark a document updated and, when ``tags`` is given, replace its OWN tags (its memories
-        are retagged by :meth:`retag_document_memories`). ``False`` if the document is absent.
+        are retagged by :meth:`retag_document_memories`). ``observation_scopes``, when given,
+        replaces the scoping the document's retain params carry, which is what a reprocess
+        retains with. ``False`` if the document is absent.
 
         ``found`` is what :meth:`current_document_tags` saw in the same transaction. Default:
-        trusts it and writes the record's tags with :meth:`set_document_tags`. Postgres updates
-        the `documents` row and answers from the UPDATE itself."""
+        trusts it and writes the record with :meth:`set_document_observation_scopes` and
+        :meth:`set_document_tags`. Postgres updates the `documents` row and answers from the
+        UPDATE itself."""
         if not found:
             return False
+        if observation_scopes is not None:
+            await self.set_document_observation_scopes(
+                bank_id=bank_id, document_id=document_id, observation_scopes=observation_scopes
+            )
         if tags is not None:
             await self.set_document_tags(bank_id=bank_id, document_id=document_id, tags=list(tags))
         return True
@@ -2966,13 +3059,18 @@ class MemoriesExtension(Extension, ABC):
         fq_table,
         bank_id: str,
         document_id: str,
-        tags: list[str],
+        tags: list[str] | None,
         retagged: Callable[[list[str] | None], list[str]],
         rescoped: Callable[[Any], str | None],
-    ) -> int:
-        """Retag a document's memories to ``tags``, then invalidate the observations built on them
-        and requeue their sources, so the next consolidation rebuilds them under the new tags.
-        Returns how many observations were deleted.
+    ) -> RetagResult:
+        """Retag a document's memories to ``tags``, then invalidate the observations built on the
+        memories whose observation scopes that moves, and requeue their sources, so the next
+        consolidation rebuilds them under the new scopes. A memory whose scopes stay put (``shared``,
+        or an explicit scope list the retag does not touch) keeps its observations (#5593).
+        Every memory that moved is requeued, whether or not it had an observation.
+
+        ``tags`` is ``None`` for a change of observation scopes alone (#5309): every memory keeps
+        the tags it has, and ``retagged`` returns them unchanged.
 
         ``retagged(existing_tags)`` is a memory's final tag list (the document's tags plus the
         label projection it keeps); ``rescoped(observation_scopes)`` is its new scopes as JSON,
@@ -2984,29 +3082,43 @@ class MemoriesExtension(Extension, ABC):
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
         )
         _doc_units = _doc_page.memories
+        from ..consolidation.consolidator import write_scopes_changed
+
+        # Only the memories whose observation scopes actually move (#5593). Decided BEFORE the
+        # patch below: a store may hand back live records that the patch then rewrites.
+        _src_ids: list[str] = []
+        for m in _doc_units:
+            if m.fact_type not in ("experience", "world"):
+                continue
+            _new_scopes = rescoped(m.observation_scopes)
+            if write_scopes_changed(
+                m.tags,
+                m.observation_scopes,
+                retagged(m.tags),
+                m.observation_scopes if _new_scopes is None else _new_scopes,
+            ):
+                _src_ids.append(m.unit_id)
         if _doc_units:
             _patches = []
             for m in _doc_units:
-                _patch = MemoryPatch(unit_id=m.unit_id, tags=retagged(m.tags))
+                _patch = MemoryPatch(unit_id=m.unit_id, tags=retagged(m.tags) if tags is not None else None)
                 _scopes_json = rescoped(m.observation_scopes)
                 if _scopes_json is not None:
                     _patch.metadata = {META_OBSERVATION_SCOPES: _scopes_json}
-                _patches.append(_patch)
-            await self.update_memories(bank_id, _patches)
-        _src_ids = [m.unit_id for m in _doc_units if m.fact_type in ("experience", "world")]
+                if _patch.tags is not None or _patch.metadata is not None:
+                    _patches.append(_patch)
+            if _patches:
+                await self.update_memories(bank_id, _patches)
         if _src_ids:
             invalidated_obs = await self.delete_stale_observations(
                 conn=conn, ops=ops, fq_table=fq_table, bank_id=bank_id, fact_ids=_src_ids
             )
-            # Only when an observation actually went — the same condition Postgres requeues
-            # under. Requeueing regardless re-consolidates the document's memories on a retag
-            # that invalidated nothing, and the marker it clears is the only record that they
-            # were ever consolidated: the next refresh has no way to tell the difference.
-            if invalidated_obs:
-                await self.mark_consolidated(
-                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=_src_ids, when=None
-                )
-        return invalidated_obs
+            # Every memory that moved, whether or not an observation went: it was consolidated
+            # under scopes it no longer writes to, and one that produced no observation there
+            # still has to be tried in its new scope (#5309). The same rule a re-retain follows
+            # (update_memory_units_metadata_and_tags); a memory that did not move is not here.
+            await self.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=_src_ids, when=None)
+        return RetagResult(invalidated_observations=invalidated_obs, requeued_units=len(_src_ids))
 
     async def list_documents_page(
         self,
@@ -3024,16 +3136,14 @@ class MemoriesExtension(Extension, ABC):
         limit: int,
         offset: int,
     ) -> dict:
-        """A page of the bank's documents — ``{items, total, limit, offset}``.
+        """A page of the bank's documents — ``{items, total, limit, offset, total_is_estimate}``.
 
         Default: :meth:`list_documents` on the store's own registry. Postgres pages the
         `documents` table on a connection it acquires from ``backend``."""
         return await self.list_documents(
             bank_id=bank_id,
             search_query=search_query,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
+            **_tag_filter_kwargs(tags, tags_match, tag_groups),
             time_field=time_field,
             start_date=start_date,
             end_date=end_date,
@@ -3273,9 +3383,7 @@ class MemoriesExtension(Extension, ABC):
             bank_id=bank_id,
             limit=limit,
             min_count=min_count,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
+            **_tag_filter_kwargs(tags, tags_match, tag_groups),
         )
 
     async def count_bank_documents(self, *, conn, fq_table, bank_id: str) -> int:
@@ -3313,9 +3421,7 @@ class MemoriesExtension(Extension, ABC):
             fq_table=fq_table,
             bank_id=bank_id,
             entity_ids=[eid],
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
+            **_tag_filter_kwargs(tags, tags_match, tag_groups),
         )
         if tag_filter_active(tags, tags_match, tag_groups) and eid not in counts:
             return None
@@ -3380,6 +3486,10 @@ class MemoriesExtension(Extension, ABC):
     async def lock_pending_document(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
         """Insert a ``'__pending__'`` document row if none exists, then row-lock it — the
         zero-batch retain's document tracking. A no-op here: there is no row."""
+
+    async def lock_document_row(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
+        """Row-lock the document before touching its memories — the order every writer of a
+        document's memories takes, consolidation included (#5433). A no-op here: there is no row."""
 
     async def lock_document_hash(self, *, conn, fq_table, bank_id: str, document_id: str) -> str | None:
         """Row-lock the document and read its content_hash (``None`` if absent) — the delta
@@ -3477,8 +3587,8 @@ class MemoriesExtension(Extension, ABC):
         """Give every memory of the document the document's current tags, metadata and
         observation scoping. ``final_tags`` maps a memory's current tags to the ones it ends with
         (the document tags, plus the label projection it already carries)."""
+        from ..consolidation.consolidator import write_scopes_changed
         from ..metadata_utils import drop_null_values
-        from ..retain.fact_storage import _normalize_scopes
 
         page = await self.scan_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
@@ -3494,35 +3604,40 @@ class MemoriesExtension(Extension, ABC):
         # chunk_id, consolidation_failed_at, …) and a patch that carried user keys loose among them
         # could not be told apart from one setting an internal field.
         #
-        # Set unconditionally, mirroring Postgres's `SET metadata = $4`: a document whose metadata
-        # was cleared must clear on its survivors too, which an absent key would not do.
+        # Set in full on every patched memory, mirroring Postgres's `SET metadata = $4`: a document
+        # whose metadata was cleared must clear on its survivors too, which an absent key would not do.
         new_tags_by_unit = {m.unit_id: final_tags(m.tags) for m in page.memories}
+        new_metadata = drop_null_values(metadata or {})
+        # Only memories whose labels actually differ: a patch moves `updated_at`, the "this
+        # fact was edited" signal consolidation discards an in-flight batch on (#5614), so a
+        # re-send of an unchanged document must patch nothing.
         patches = [
             MemoryPatch(
                 unit_id=m.unit_id,
                 tags=new_tags_by_unit[m.unit_id],
                 metadata={
-                    META_METADATA_JSON: json.dumps(drop_null_values(metadata or {})),
+                    META_METADATA_JSON: json.dumps(new_metadata),
                     META_OBSERVATION_SCOPES: json.dumps(observation_scopes),
                 },
             )
             for m in page.memories
+            if m.tags != new_tags_by_unit[m.unit_id]
+            or (m.metadata or {}) != new_metadata
+            or m.observation_scopes != observation_scopes
         ]
-        if patches:
-            await self.update_memories(bank_id, patches)
         # Against the tags the unit will actually END with, not the document's: a survivor
         # keeping its label projection has not been rescoped, and comparing it to the bare
         # document tags reported every such unit as moved on every retain — an observation
-        # sweep and a full re-consolidation of the document for no change at all.
+        # sweep and a full re-consolidation of the document for no change at all. Decided
+        # BEFORE the patch: a store may hand back live records that the patch then rewrites.
         rescoped = [
             m.unit_id
             for m in page.memories
             if m.fact_type in ("experience", "world")
-            and (
-                set(m.tags or []) != set(new_tags_by_unit[m.unit_id])
-                or _normalize_scopes(m.observation_scopes) != _normalize_scopes(observation_scopes)
-            )
+            and write_scopes_changed(m.tags, m.observation_scopes, new_tags_by_unit[m.unit_id], observation_scopes)
         ]
+        if patches:
+            await self.update_memories(bank_id, patches)
         return RelabelResult(updated=len(patches), rescoped_unit_ids=rescoped)
 
     async def memory_ids_for_chunks(self, *, conn, fq_table, bank_id: str, chunk_ids: list[str]) -> list[str]:
@@ -3667,6 +3782,16 @@ class MemoriesExtension(Extension, ABC):
     # consolidation batch's transaction, so every write derived from one LLM response commits or
     # rolls back together (#3876). The defaults are what a store that owns its rows does;
     # Postgres overrides them with the SQL in ``pg/consolidation.py``.
+
+    async def lock_consolidation_write_set(
+        self, *, conn, fq_table, bank_id: str, fact_ids: list[str], observation_ids: list[str]
+    ) -> None:
+        """Lock what one consolidation response writes — the batch ``fact_ids``, the
+        ``observation_ids`` it rewrites, deletes or folds into — before it writes any of it, in
+        the order other writers take them, so the two cannot deadlock (#5433).
+
+        A no-op here: a store that keeps memories outside SQL has its own concurrency model.
+        """
 
     async def lock_live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[uuid.UUID]) -> set[str]:
         """Which of ``unit_ids`` still exist, held so a concurrent delete cannot remove one before
@@ -4069,25 +4194,33 @@ class MemoriesExtension(Extension, ABC):
 
         return await _load_observations_from_store(self, bank_id, unit_index)
 
-    async def dump_entity_maintenance_queue(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        """The bank's entity-maintenance queue for export, each entity named rather than numbered.
+    async def iter_entity_maintenance_queue(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        """The bank's entity-maintenance queue for export, ``page_size`` rows at a time, each entity named
+        rather than numbered.
 
-        Postgres joins the queue to `entities` on ``conn``. Empty here: a store that keeps its own
-        entity registry queues no entity maintenance in Postgres (see
-        :meth:`enqueue_entity_prune_candidates`).
+        ``backend`` is a pool or one connection. Postgres joins the queue to `entities`, each page on a
+        connection it returns before the page is yielded. Empty here: a store that keeps its own entity
+        registry queues no entity maintenance in Postgres (see :meth:`enqueue_entity_prune_candidates`).
         """
-        return []
+        return
+        yield  # unreachable: makes this an async generator that yields no pages
 
-    async def dump_archived_memories(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        """The curation archive (invalidated, still revertable memories) as portable export rows.
+    async def iter_archived_memories(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        """The curation archive (invalidated, still revertable memories) as portable export rows, by page.
 
         One dict per archived memory, keyed like an `invalidated_memory_units` row, except that
         ``entity_ids`` becomes ``entity_names`` (canonical names), ``chunk_id`` becomes
-        ``chunk_index`` (the id embeds the bank), and the surrogate ``id`` is dropped. Postgres
-        reads the archive table on ``conn``. No default: the interface has no way to list an
-        archive, so a store that owns its memories must answer this itself.
+        ``chunk_index`` (the id embeds the bank), and the surrogate ``id`` is dropped. ``backend`` is a
+        pool or one connection; Postgres reads the archive table ``page_size`` rows at a time. No
+        default: the interface has no way to list an archive, so a store that owns its memories must
+        answer this itself — raising before it yields anything.
         """
         raise NotImplementedError("this store cannot list its archived memories")
+        yield  # unreachable: makes this an async generator, so the error is raised on first iteration
 
     async def restore_archived_memories(
         self,
@@ -4100,12 +4233,12 @@ class MemoriesExtension(Extension, ABC):
         document_id_map: dict[str, str],
         bank_rows_json_encoding: str,
     ) -> int:
-        """Write :meth:`dump_archived_memories` rows into this bank's archive; returns how many.
+        """Write one page of :meth:`iter_archived_memories` rows into this bank's archive; returns how many.
 
         ``unit_id_map`` / ``document_id_map`` map the source's unit and document ids to the ones the
         import wrote (a causal-link snapshot whose endpoint did not come back is dropped). Postgres
         re-resolves the entity names and inserts on ``conn``. No default, like
-        :meth:`dump_archived_memories`.
+        :meth:`iter_archived_memories`.
         """
         raise NotImplementedError("this store cannot restore archived memories")
 

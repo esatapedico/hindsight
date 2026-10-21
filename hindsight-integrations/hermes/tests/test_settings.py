@@ -83,3 +83,4 @@ def test_clears_min_scores_rejects_a_result_that_does_not_report_the_floored_sta
 def test_clears_min_scores_keeps_a_result_with_no_scores_at_all():
     assert _clears_min_scores(types.SimpleNamespace(scores=None), {"semantic": 0.9})
     assert _clears_min_scores(types.SimpleNamespace(), {"semantic": 0.9})
+
