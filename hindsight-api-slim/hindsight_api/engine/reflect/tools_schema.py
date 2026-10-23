@@ -10,6 +10,8 @@ The reflect agent uses a hierarchical retrieval strategy:
 
 import copy
 
+from .prompts import NO_IDS_IN_TEXT_RULE
+
 # Tool definitions in OpenAI format
 
 TOOL_SEARCH_MENTAL_MODELS = {
@@ -188,13 +190,26 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
 #: merely shared the question's topic read as enough, and the reflect loop had
 #: already released the forced lower layers (see agent.py's short-circuit, and
 #: #4567). The retrieval-levels section of the system prompt carries the same
-#: rule once; this is the copy at the decision point.
+#: rule once; this is the copy at the decision point. Measured on the reporter's
+#: banks, this wording alone did not make the model recall before a negative, so
+#: the absence half is also enforced in code through ``answer_found`` below.
 _DONE_SUFFICIENCY_GATE = (
     " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
     "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
     "instead of answering around it. Never call done to report that nothing is known unless recall has already "
     "run on the question's key terms."
 )
+
+#: The model's own verdict on whether it found the answer. Prose can't be
+#: checked, a bool can: when it is false and recall has not run yet, the agent
+#: loop refuses the ``done`` and forces a recall first (#4567).
+_DONE_ANSWER_FOUND_PROPERTY = {
+    "type": "boolean",
+    "description": (
+        "true if what you retrieved states the answer to the question. false if you are reporting that "
+        "nothing (or not enough) is known about it."
+    ),
+}
 
 TOOL_DONE_ANSWER = {
     "type": "function",
@@ -230,8 +245,9 @@ TOOL_DONE_ANSWER = {
                     "items": {"type": "string"},
                     "description": "Array of observation IDs that support your answer",
                 },
+                "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
             },
-            "required": ["answer"],
+            "required": ["answer", "answer_found"],
         },
     },
 }
@@ -279,7 +295,7 @@ _DONE_DOCUMENT_PROPERTY = {
                             "paragraphs in one entry, and never put a heading in one — headings are the "
                             "'heading' field. Within an entry, write the content as you would in a "
                             "document: '- one\n- two' for a list, "
-                            "'| a | b |\n| --- | --- |\n| 1 | 2 |' for a table."
+                            "'| a | b |\n| --- | --- |\n| 1 | 2 |' for a table. " + NO_IDS_IN_TEXT_RULE
                         ),
                         "items": {"type": "string"},
                     },
@@ -375,15 +391,42 @@ def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
                         "items": {"type": "string"},
                         "description": "Array of observation IDs that support your answer",
                     },
+                    "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
                     "directive_compliance": {
                         "type": "string",
                         "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
                     },
                 },
-                "required": ["answer", "directive_compliance"],
+                "required": ["answer", "answer_found", "directive_compliance"],
             },
         },
     }
+
+
+#: ``_DONE_SUFFICIENCY_GATE`` for the tool that decides to stop when that is answer_ready.
+_READY_SUFFICIENCY_GATE = _DONE_SUFFICIENCY_GATE.replace("call done", "call answer_ready")
+
+#: The stop signal for reflects whose answer is written by the closing step: a turn that
+#: wrote the answer itself (as prose or as ``done``) was thrown away and written again
+#: there, so the model's last free turn cost as much as the answer (#5832).
+TOOL_ANSWER_READY = {
+    "type": "function",
+    "function": {
+        "name": "answer_ready",
+        # The sufficiency gate moves here with the stop decision: done is only called once asked.
+        "description": (
+            "Call this when what you retrieved is enough to answer. You will then be asked for the answer "
+            "through done. Do not write the answer before you are asked for it." + _READY_SUFFICIENCY_GATE
+        ),
+        # The one argument is done's own verdict, so the "nothing is known needs recall first"
+        # gate (#4567) still sees it: the answer itself is only written in the closing step.
+        "parameters": {
+            "type": "object",
+            "properties": {"answer_found": _DONE_ANSWER_FOUND_PROPERTY},
+            "required": ["answer_found"],
+        },
+    },
+}
 
 
 def get_reflect_tools(
@@ -394,6 +437,7 @@ def get_reflect_tools(
     include_expand: bool = True,
     answer_as_document: bool = False,
     llm_output_language: str | None = None,
+    answer_ready: bool = False,
 ) -> list[dict]:
     """
     Get the list of tools for the reflect agent.
@@ -418,6 +462,8 @@ def get_reflect_tools(
             markdown that gets persisted.
         llm_output_language: Configured output language. Swaps ``done``'s default
             answer-in-the-question's-language rule for a directive to write in it.
+        answer_ready: Offer ``answer_ready``, the stop signal (one ``answer_found``
+            bool), for a reflect whose answer the closing step writes.
 
     Returns:
         List of tool definitions in OpenAI format
@@ -435,6 +481,8 @@ def get_reflect_tools(
 
     if include_expand:
         tools.append(TOOL_EXPAND)
+    if answer_ready:
+        tools.append(TOOL_ANSWER_READY)
 
     # Use directive-aware done tool if directives are present
     if directive_rules:
@@ -443,7 +491,16 @@ def get_reflect_tools(
         done_tool = TOOL_DONE_ANSWER
     if answer_as_document:
         done_tool = _done_tool_for_document(done_tool)
-    # After the document swap: that replaces the tool description this appends to.
+    if answer_ready:
+        done_tool = copy.deepcopy(done_tool)
+        # Keeps the sufficiency gate: dropping it with the rest of the old description let the
+        # closing answer infer a value the evidence did not state (system eval hq-absent-2024).
+        done_tool["function"]["description"] = (
+            f"Your final answer{', as a structured document' if answer_as_document else ''}. Call this only when "
+            "you are asked for the answer; until then, call "
+            "answer_ready once you have enough." + _DONE_SUFFICIENCY_GATE
+        )
+    # After the document and answer_ready swaps: those replace the description this appends to.
     if llm_output_language:
         done_tool = _done_tool_for_output_language(done_tool, llm_output_language)
     tools.append(done_tool)

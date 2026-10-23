@@ -71,6 +71,9 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "enable_temporal_retrieval": False,
     "enable_graph_retrieval": False,
     "enable_reranking": False,
+    "reflect_use_decision_model": False,
+    "mental_model_refresh_use_decision_model": False,
+    "mental_model_delta_use_decision_model": False,
     "disposition_skepticism": 4,
     "disposition_literalism": 2,
     "disposition_empathy": 5,
@@ -98,6 +101,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "consolidation_source_facts_max_tokens_per_observation": 256,
     "max_observations_per_scope": 13,
     "observation_scope_limits": [{"scope": ["run_*"], "limit": 2}],
+    "default_observation_scopes": [["topic:*", "user:*"]],
     "consolidation_strategies": [
         {
             "scopes": [{"tags": ["company:*"]}],
@@ -125,9 +129,11 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "audit_log_enabled": True,
     "store_document_text": False,
     "enable_auto_consolidation": False,
+    "consolidation_use_decision_model": False,
     "consolidation_max_memories_per_round": 42,
     "consolidation_llm_parallelism": 3,
     "recall_include_chunks": True,
+    "recall_prefer_observations": True,
     "recall_max_tokens": 9000,
     "recall_chunks_max_tokens": 4500,
     # Validated against the DefensePolicy schema on write (parse_policy), so this

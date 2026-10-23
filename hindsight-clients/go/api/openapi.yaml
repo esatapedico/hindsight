@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.10.3
+  version: 1.1.0
 servers:
 - url: /
 paths:
@@ -117,7 +117,11 @@ paths:
           title: Limit
           type: integer
         style: form
-      - explode: true
+      - description: "Case-insensitive substring filter on memory text and context.\
+          \ Not indexed: it scans the bank, so it slows as the bank grows. Meant for\
+          \ browsing and inspection, not for high-volume or latency-sensitive workloads\
+          \ — use recall for that."
+        explode: true
         in: query
         name: q
         required: false
@@ -142,6 +146,12 @@ paths:
         required: false
         schema:
           default: all_strict
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
           title: Tags Match
           type: string
         style: form
@@ -189,10 +199,10 @@ paths:
       - Memory
   /v1/default/banks/{bank_id}/memories/list:
     get:
-      description: "List memory units with pagination and optional full-text search.\
-        \ Supports filtering by type, source document, linked entity ID, and a time\
-        \ window. Results are sorted by most recent first (mentioned_at DESC, then\
-        \ created_at DESC) unless a time window selects another axis."
+      description: "List memory units with pagination and an optional substring filter\
+        \ (`q`). Supports filtering by type, source document, linked entity ID, and\
+        \ a time window. Results are sorted by most recent first (mentioned_at DESC,\
+        \ then created_at DESC) unless a time window selects another axis."
       operationId: list_memories
       parameters:
       - explode: false
@@ -211,7 +221,11 @@ paths:
           nullable: true
           type: string
         style: form
-      - explode: true
+      - description: "Case-insensitive substring filter on memory text and context.\
+          \ Not indexed: it scans the bank, so it slows as the bank grows. Meant for\
+          \ browsing and inspection, not for high-volume or latency-sensitive workloads\
+          \ — use recall for that."
+        explode: true
         in: query
         name: q
         required: false
@@ -1350,6 +1364,19 @@ paths:
           title: Offset
           type: integer
         style: form
+      - description: Leave out the mental models that hold knowledge page content
+          (list standalone models only).
+        explode: true
+        in: query
+        name: exclude_knowledge_pages
+        required: false
+        schema:
+          default: false
+          description: Leave out the mental models that hold knowledge page content
+            (list standalone models only).
+          title: Exclude Knowledge Pages
+          type: boolean
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -1623,8 +1650,12 @@ paths:
       - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh:
     post:
-      description: Submit an async task to re-run the source query through reflect
-        and update the content.
+      description: "Submit an async task to re-run the source query through reflect\
+        \ and update the content. With no body the refresh runs in the model's own\
+        \ `trigger.mode`. Send `{\"mode\": \"full\"}` for a full refresh: the content\
+        \ is regenerated from scratch this once (to clear the drift delta edits accumulate)\
+        \ while the stored trigger keeps its mode. Unlike clearing the model first,\
+        \ a full refresh that fails leaves the previous content in place."
       operationId: refresh_mental_model
       parameters:
       - explode: false
@@ -1651,6 +1682,11 @@ paths:
           nullable: true
           type: string
         style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshMentalModelRequest'
       responses:
         "200":
           content:
@@ -2527,8 +2563,12 @@ paths:
           title: Bank Id
           type: string
         style: simple
-      - description: Case-insensitive substring filter on document ID (e.g. 'report'
-          matches 'report-2024')
+      - description: "Case-insensitive substring filter on document ID or document\
+          \ text (e.g. 'report' matches 'report-2024' or any document containing 'report').\
+          \ Meant for browsing and inspection, not for high-volume or latency-sensitive\
+          \ workloads — use recall for that. Matches are capped: past the cap, `total`\
+          \ is a lower bound and `total_is_estimate` is true. A store-owned backend\
+          \ may match approximately; each item's `matched_fields` says what matched."
         explode: true
         in: query
         name: q
@@ -2548,14 +2588,22 @@ paths:
           nullable: true
           type: array
         style: form
-      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict',\
+          \ 'exact'"
         explode: true
         in: query
         name: tags_match
         required: false
         schema:
           default: any_strict
-          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict',\
+            \ 'exact'"
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
           title: Tags Match
           type: string
         style: form
@@ -2709,6 +2757,79 @@ paths:
       summary: List document chunks
       tags:
       - Documents
+  /v1/default/banks/{bank_id}/documents/{document_id}/history:
+    get:
+      description: |-
+        What each change to a document did, newest first: every retain, append and reprocess (facts added and removed), every fact edit, invalidation, restore, delete, retag and per-fact observation clear (observations removed), and every consolidation run (observations created, updated and removed). Observations are rebuilt, not versioned, so this is the only record of the ones a change removed. Ids and counts only, with each id list capped at 100.
+
+        Rebuilt from the bank's async operations, which carry these events: it reaches back only as far as operations are kept (HINDSIGHT_API_OPERATION_RETENTION_DAYS, unlimited by default), and a change that ran without an operation is not in it — a synchronous retain (async=false), or a fact edit, delete or retag while auto-consolidation is off. A fact edit, delete or retag is recorded on the consolidation operation it queues. Clearing every observation in the bank is not listed. total, limit and offset count operations, not events.
+      operationId: get_document_history
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+        style: simple
+      - description: Maximum number of operations to read
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Maximum number of operations to read
+          maximum: 1000
+          minimum: 1
+          title: Limit
+          type: integer
+        style: form
+      - description: "Offset for pagination, in operations"
+        explode: true
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: "Offset for pagination, in operations"
+          minimum: 0
+          title: Offset
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentHistoryResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get document change history
+      tags:
+      - Documents
   /v1/default/banks/{bank_id}/documents/{document_id}/reprocess:
     post:
       description: "Re-run the retain pipeline on an existing document without changing\
@@ -2860,7 +2981,11 @@ paths:
 
         **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
 
-        The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
+        The new tags are propagated to all associated memory units.
+
+        **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
+
+        A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
 
         At least one field must be provided.
       operationId: update_document
@@ -3249,7 +3374,9 @@ paths:
       - Operations
   /v1/default/banks/{bank_id}/operations/{operation_id}/retry:
     post:
-      description: Re-queue a failed async operation so the worker picks it up again
+      description: "Re-queue a failed or cancelled async operation so the worker picks\
+        \ it up again. On a deferred operation (pending with a future next_retry_at),\
+        \ runs it now."
       operationId: retry_operation
       parameters:
       - explode: false
@@ -5501,6 +5628,53 @@ paths:
       summary: Audit log statistics
       tags:
       - Audit
+  /v1/default/banks/{bank_id}/audit-logs/{log_id}:
+    get:
+      description: Get one audit log entry with its full request and response bodies.
+      operationId: get_audit_log
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: log_id
+        required: true
+        schema:
+          title: Log Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogEntry'
+          description: Successful Response
+        "404":
+          description: Bank or audit log entry not found
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get audit log entry
+      tags:
+      - Audit
   /v1/default/banks/{bank_id}/llm-requests:
     get:
       description: "List traced LLM requests for a bank, ordered by most recent first.\
@@ -5539,6 +5713,21 @@ paths:
         name: scope
         required: false
         schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "Filter by kind of model call, told apart by scope: embedding\
+          \ (embedding_*), rerank, decision (decision_*), or llm (every other scope)"
+        explode: true
+        in: query
+        name: call_type
+        required: false
+        schema:
+          enum:
+          - llm
+          - embedding
+          - rerank
+          - decision
           nullable: true
           type: string
         style: form
@@ -5683,6 +5872,20 @@ paths:
           nullable: true
           type: string
         style: form
+      - description: "Filter by kind of model call: llm, embedding, rerank or decision"
+        explode: true
+        in: query
+        name: call_type
+        required: false
+        schema:
+          enum:
+          - llm
+          - embedding
+          - rerank
+          - decision
+          nullable: true
+          type: string
+        style: form
       - description: "Time period: 1d, 7d, or 30d"
         explode: true
         in: query
@@ -5758,9 +5961,9 @@ components:
       - status
       title: AsyncOperationSubmitResponse
     AuditLogEntry:
-      description: A single audit log entry.
+      description: A single audit log entry with its full request/response bodies.
       example:
-        duration_ms: 5
+        duration_ms: 0
         request:
           key: ""
         metadata:
@@ -5795,15 +5998,15 @@ components:
         duration_ms:
           nullable: true
           type: integer
+        metadata:
+          additionalProperties: {}
+          title: Metadata
         request:
           additionalProperties: {}
           nullable: true
         response:
           additionalProperties: {}
           nullable: true
-        metadata:
-          additionalProperties: {}
-          title: Metadata
       required:
       - action
       - bank_id
@@ -5824,26 +6027,18 @@ components:
         limit: 6
         items:
         - duration_ms: 5
-          request:
-            key: ""
           metadata:
             key: ""
           bank_id: bank_id
-          response:
-            key: ""
           action: action
           started_at: started_at
           id: id
           transport: transport
           ended_at: ended_at
         - duration_ms: 5
-          request:
-            key: ""
           metadata:
             key: ""
           bank_id: bank_id
-          response:
-            key: ""
           action: action
           started_at: started_at
           id: id
@@ -5863,8 +6058,10 @@ components:
           title: Offset
           type: integer
         items:
+          description: Entries without request/response bodies; fetch one entry by
+            id for its bodies.
           items:
-            $ref: '#/components/schemas/AuditLogEntry'
+            $ref: '#/components/schemas/AuditLogSummary'
           type: array
       required:
       - bank_id
@@ -5936,6 +6133,53 @@ components:
       - start
       - trunc
       title: AuditLogStatsResponse
+    AuditLogSummary:
+      description: "An audit log entry without its request/response bodies, as the\
+        \ list returns it."
+      example:
+        duration_ms: 5
+        metadata:
+          key: ""
+        bank_id: bank_id
+        action: action
+        started_at: started_at
+        id: id
+        transport: transport
+        ended_at: ended_at
+      properties:
+        id:
+          title: Id
+          type: string
+        action:
+          title: Action
+          type: string
+        transport:
+          title: Transport
+          type: string
+        bank_id:
+          nullable: true
+          type: string
+        started_at:
+          nullable: true
+          type: string
+        ended_at:
+          nullable: true
+          type: string
+        duration_ms:
+          nullable: true
+          type: integer
+        metadata:
+          additionalProperties: {}
+          title: Metadata
+      required:
+      - action
+      - bank_id
+      - ended_at
+      - id
+      - metadata
+      - started_at
+      - transport
+      title: AuditLogSummary
     BackgroundResponse:
       description: "Response model for background update. Deprecated: use MissionResponse\
         \ instead."
@@ -6344,6 +6588,15 @@ components:
         enable_reranking:
           nullable: true
           type: boolean
+        reflect_use_decision_model:
+          nullable: true
+          type: boolean
+        mental_model_refresh_use_decision_model:
+          nullable: true
+          type: boolean
+        mental_model_delta_use_decision_model:
+          nullable: true
+          type: boolean
         disposition_skepticism:
           maximum: 5.0
           minimum: 1.0
@@ -6401,6 +6654,8 @@ components:
             additionalProperties: {}
           nullable: true
           type: array
+        default_observation_scopes:
+          $ref: '#/components/schemas/Default_Observation_Scopes'
         consolidation_strategies:
           items:
             $ref: '#/components/schemas/ConsolidationStrategySpec'
@@ -6459,6 +6714,9 @@ components:
         enable_auto_consolidation:
           nullable: true
           type: boolean
+        consolidation_use_decision_model:
+          nullable: true
+          type: boolean
         consolidation_max_memories_per_round:
           nullable: true
           type: integer
@@ -6466,6 +6724,9 @@ components:
           nullable: true
           type: integer
         recall_include_chunks:
+          nullable: true
+          type: boolean
+        recall_prefer_observations:
           nullable: true
           type: boolean
         recall_max_tokens:
@@ -7201,8 +7462,8 @@ components:
       properties:
         alias:
           description: "The extra bank id. Same rules as a bank id (non-empty, at\
-            \ most 192 bytes of UTF-8, no control characters), and it must not already\
-            \ name a bank or another alias."
+            \ most 192 bytes of UTF-8, no control characters, no leading underscore),\
+            \ and it must not already name a bank or another alias."
           title: Alias
           type: string
         primary:
@@ -7448,6 +7709,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -7766,6 +8028,83 @@ components:
       - literalism
       - skepticism
       title: DispositionTraits
+    DocumentEvent:
+      description: "One change to a document, and its effect on the facts and observations\
+        \ built from it."
+      example:
+        observations_removed:
+          count: 2
+          ids:
+          - ids
+          - ids
+        observations_created:
+          count: 2
+          ids:
+          - ids
+          - ids
+        fact_id: fact_id
+        kind: retain
+        facts_removed: 5
+        observations_updated:
+          count: 2
+          ids:
+          - ids
+          - ids
+        created_at: 2000-01-23T04:56:07.000+00:00
+        facts_added: 5
+        operation_id: operation_id
+        document_id: document_id
+      properties:
+        document_id:
+          title: Document Id
+          type: string
+        kind:
+          $ref: '#/components/schemas/DocumentEventKind'
+        created_at:
+          format: date-time
+          title: Created At
+          type: string
+        operation_id:
+          nullable: true
+          type: string
+        fact_id:
+          nullable: true
+          type: string
+        facts_added:
+          default: 0
+          title: Facts Added
+          type: integer
+        facts_removed:
+          default: 0
+          title: Facts Removed
+          type: integer
+        observations_created:
+          $ref: '#/components/schemas/ObservationIdSample'
+        observations_updated:
+          $ref: '#/components/schemas/ObservationIdSample'
+        observations_removed:
+          $ref: '#/components/schemas/ObservationIdSample'
+      required:
+      - document_id
+      - kind
+      title: DocumentEvent
+    DocumentEventKind:
+      description: |-
+        What a change was. A named enum, not a Literal: inline enums are named after their field by
+        the generated Rust client, and ``kind`` already names the knowledge-base node enum there.
+      enum:
+      - retain
+      - append
+      - reprocess
+      - retag
+      - fact_edited
+      - fact_invalidated
+      - fact_restored
+      - fact_deleted
+      - observations_cleared
+      - consolidation
+      title: DocumentEventKind
+      type: string
     DocumentExportSubmitResponse:
       description: |-
         Response for the async document-export endpoint (202).
@@ -7788,6 +8127,84 @@ components:
       required:
       - operation_id
       title: DocumentExportSubmitResponse
+    DocumentHistoryResponse:
+      description: |-
+        A document's change history, newest first. ``total``, ``limit`` and ``offset`` count operations:
+        one operation can carry several events for the same document (an oversized retain in slices).
+      example:
+        total: 0
+        offset: 1
+        limit: 6
+        document_id: document_id
+        items:
+        - observations_removed:
+            count: 2
+            ids:
+            - ids
+            - ids
+          observations_created:
+            count: 2
+            ids:
+            - ids
+            - ids
+          fact_id: fact_id
+          kind: retain
+          facts_removed: 5
+          observations_updated:
+            count: 2
+            ids:
+            - ids
+            - ids
+          created_at: 2000-01-23T04:56:07.000+00:00
+          facts_added: 5
+          operation_id: operation_id
+          document_id: document_id
+        - observations_removed:
+            count: 2
+            ids:
+            - ids
+            - ids
+          observations_created:
+            count: 2
+            ids:
+            - ids
+            - ids
+          fact_id: fact_id
+          kind: retain
+          facts_removed: 5
+          observations_updated:
+            count: 2
+            ids:
+            - ids
+            - ids
+          created_at: 2000-01-23T04:56:07.000+00:00
+          facts_added: 5
+          operation_id: operation_id
+          document_id: document_id
+      properties:
+        document_id:
+          title: Document Id
+          type: string
+        total:
+          title: Total
+          type: integer
+        limit:
+          title: Limit
+          type: integer
+        offset:
+          title: Offset
+          type: integer
+        items:
+          items:
+            $ref: '#/components/schemas/DocumentEvent'
+          type: array
+      required:
+      - document_id
+      - items
+      - limit
+      - offset
+      - total
+      title: DocumentHistoryResponse
     DocumentImportSubmitResponse:
       description: |-
         Response for the async document-import endpoint (202).
@@ -7858,6 +8275,16 @@ components:
           default: []
           description: Tags associated with this document
           items:
+            type: string
+          type: array
+        matched_fields:
+          default: []
+          description: "Which fields matched the `q` search: 'id', 'original_text',\
+            \ or both. Empty when no `q` is given."
+          items:
+            enum:
+            - id
+            - original_text
             type: string
           type: array
       required:
@@ -8737,6 +9164,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -9007,6 +9435,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -9056,6 +9485,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -9609,6 +10039,12 @@ components:
         offset:
           title: Offset
           type: integer
+        total_is_estimate:
+          default: false
+          description: "True when a `q` search stopped at its match cap, so `total`\
+            \ is a lower bound rather than an exact count. Always false without `q`."
+          title: Total Is Estimate
+          type: boolean
       required:
       - items
       - limit
@@ -10419,6 +10855,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -10441,7 +10878,9 @@ components:
           tags:
           - tags
           - tags
+          last_full_refreshed_at: last_full_refreshed_at
           source_query: source_query
+          is_knowledge_page: true
           bank_id: bank_id
           reflect_response:
             key: ""
@@ -10468,6 +10907,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -10490,7 +10930,9 @@ components:
           tags:
           - tags
           - tags
+          last_full_refreshed_at: last_full_refreshed_at
           source_query: source_query
+          is_knowledge_page: true
           bank_id: bank_id
           reflect_response:
             key: ""
@@ -10683,6 +11125,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -10705,7 +11148,9 @@ components:
         tags:
         - tags
         - tags
+        last_full_refreshed_at: last_full_refreshed_at
         source_query: source_query
+        is_knowledge_page: true
         bank_id: bank_id
         reflect_response:
           key: ""
@@ -10746,9 +11191,15 @@ components:
         last_refresh_failed_at:
           nullable: true
           type: string
+        last_full_refreshed_at:
+          nullable: true
+          type: string
         created_at:
           nullable: true
           type: string
+        is_knowledge_page:
+          nullable: true
+          type: boolean
         reflect_response:
           additionalProperties: {}
           nullable: true
@@ -10866,6 +11317,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        full_refresh_cron: full_refresh_cron
         fact_types:
         - world
         - world
@@ -10904,6 +11356,9 @@ components:
           title: Refresh After Consolidation
           type: boolean
         refresh_cron:
+          nullable: true
+          type: string
+        full_refresh_cron:
           nullable: true
           type: string
         min_refresh_interval_seconds:
@@ -11005,6 +11460,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        full_refresh_cron: full_refresh_cron
         fact_types:
         - world
         - world
@@ -11043,6 +11499,9 @@ components:
           title: Refresh After Consolidation
           type: boolean
         refresh_cron:
+          nullable: true
+          type: string
+        full_refresh_cron:
           nullable: true
           type: string
         min_refresh_interval_seconds:
@@ -11158,6 +11617,24 @@ components:
           nullable: true
           type: number
       title: MinScores
+    ObservationIdSample:
+      description: "How many observations an event touched, and (up to ``MAX_IDS``)\
+        \ which."
+      example:
+        count: 2
+        ids:
+        - ids
+        - ids
+      properties:
+        count:
+          default: 0
+          title: Count
+          type: integer
+        ids:
+          items:
+            type: string
+          type: array
+      title: ObservationIdSample
     ObservationScope:
       description: "A distinct observation scope: an exact tag set plus its observation\
         \ count."
@@ -11723,15 +12200,7 @@ components:
           nullable: true
           type: array
         prefer_observations:
-          default: false
-          description: "When recalling raw facts ('world'/'experience') together with\
-            \ 'observation', drop any raw fact that an observation in the results\
-            \ was consolidated from, so the observation supersedes it and you don't\
-            \ get duplicate content. The freed slots are backfilled with the next\
-            \ results, keeping the result count at the requested budget. Disabled\
-            \ by default; set to true to enable. No effect unless 'observation' and\
-            \ at least one raw type are both requested."
-          title: Prefer Observations
+          nullable: true
           type: boolean
         budget:
           $ref: '#/components/schemas/Budget'
@@ -12357,6 +12826,17 @@ components:
       required:
       - outcome
       title: RefreshMentalModelOperationDetails
+    RefreshMentalModelRequest:
+      description: "Optional body of POST /mental-models/{id}/refresh."
+      example:
+        mode: full
+      properties:
+        mode:
+          enum:
+          - full
+          nullable: true
+          type: string
+      title: RefreshMentalModelRequest
     ReprocessDocumentResponse:
       description: Response model for reprocess document endpoint.
       example:
@@ -12919,6 +13399,8 @@ components:
             type: string
           nullable: true
           type: array
+        observation_scopes:
+          $ref: '#/components/schemas/UpdateDocumentObservationScopes'
       title: UpdateDocumentRequest
     UpdateDocumentResponse:
       description: Response model for update document endpoint.
@@ -12952,6 +13434,9 @@ components:
           nullable: true
           type: string
         occurred_end:
+          nullable: true
+          type: string
+        mentioned_at:
           nullable: true
           type: string
         fact_type:
@@ -13040,6 +13525,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -13180,6 +13666,7 @@ components:
           created_at: created_at
           last_response_status: 6
           url: url
+          event_id: event_id
           event_type: event_type
           updated_at: updated_at
           webhook_id: webhook_id
@@ -13193,6 +13680,7 @@ components:
           created_at: created_at
           last_response_status: 6
           url: url
+          event_id: event_id
           event_type: event_type
           updated_at: updated_at
           webhook_id: webhook_id
@@ -13220,6 +13708,7 @@ components:
         created_at: created_at
         last_response_status: 6
         url: url
+        event_id: event_id
         event_type: event_type
         updated_at: updated_at
         webhook_id: webhook_id
@@ -13231,6 +13720,9 @@ components:
       properties:
         id:
           title: Id
+          type: string
+        event_id:
+          nullable: true
           type: string
         webhook_id:
           nullable: true
@@ -13426,6 +13918,24 @@ components:
       - id
       - url
       title: WebhookResponse
+    Default_Observation_Scopes:
+      anyOf:
+      - enum:
+        - per_tag
+        - combined
+        - all_combinations
+        - shared
+        type: string
+      - items:
+          items:
+            type: string
+          type: array
+        type: array
+      description: "observation_scopes applied at retain to items that send none ('combined'\
+        \ when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes\
+        \ each memory by its own topic tags."
+      nullable: true
+      title: Default Observation Scopes
     Content_anyOf_inner:
       discriminator:
         mapping:
@@ -13482,7 +13992,12 @@ components:
         \ consolidate together regardless of their tags — useful for deduplicating\
         \ across volatile per-call provenance tags (e.g. per-session ids) while keeping\
         \ those tags on the source facts. A list of tag lists runs one pass per inner\
-        \ list, giving full control over which combinations to use."
+        \ list, giving full control over which combinations to use. An entry containing\
+        \ '*' is a glob matched against the memory's own tags — e.g. [['topic:*',\
+        \ 'user:*']] scopes by the memory's topic and user tags (including tags added\
+        \ by entity labels at retain) and ignores the rest; a scope whose globs match\
+        \ nothing is skipped. When omitted, the bank's default_observation_scopes\
+        \ applies ('combined' unless configured)."
       nullable: true
       title: ObservationScopes
     MentalModelRefreshScope_tag_groups_inner:
@@ -13511,6 +14026,28 @@ components:
       - $ref: '#/components/schemas/TagGroupOr-Output'
       - $ref: '#/components/schemas/TagGroupNot-Output'
       title: Not
+    UpdateDocumentObservationScopes:
+      anyOf:
+      - enum:
+        - per_tag
+        - combined
+        - all_combinations
+        - shared
+        type: string
+      - items:
+          items:
+            type: string
+          type: array
+        type: array
+      description: "New observation scoping for the document's memories, with the\
+        \ same values retain accepts (send 'combined' to scope by each memory's full\
+        \ tag set). Use it to move memories retained under one scoping to another\
+        \ — e.g. per-session documents to 'shared' — without re-extracting them. Memories\
+        \ whose resolved scopes change lose their observations and are re-consolidated;\
+        \ the rest keep theirs. Also becomes the scoping a later reprocess of the\
+        \ document uses."
+      nullable: true
+      title: UpdateDocumentObservationScopes
     ValidationError_loc_inner:
       anyOf:
       - type: string

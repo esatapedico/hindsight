@@ -9,6 +9,10 @@
 
 import type { Transport, TransportResponse } from "./transport";
 import type { ReflectOptions, ReflectResponse, RetainOptions } from "./types";
+// Inlined by esbuild: the installed plugin ships main.js without a package.json.
+import { version } from "../package.json";
+
+const USER_AGENT = `hindsight-obsidian/${version}`;
 
 /**
  * Encode a vault-relative document id for use in a URL `:path` segment:
@@ -33,7 +37,10 @@ export class HindsightClient {
   }
 
   private headers(): Record<string, string> {
-    const h: Record<string, string> = { "Content-Type": "application/json" };
+    const h: Record<string, string> = {
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+    };
     if (this.token) h["Authorization"] = `Bearer ${this.token}`;
     return h;
   }
@@ -42,14 +49,19 @@ export class HindsightClient {
     return `${this.baseUrl}/v1/default/banks/${encodeURIComponent(bankId)}${suffix}`;
   }
 
-  private async send(method: string, url: string, body?: unknown): Promise<TransportResponse> {
+  private async send(
+    method: string,
+    url: string,
+    body?: unknown,
+    tolerate?: (resp: TransportResponse) => boolean
+  ): Promise<TransportResponse> {
     const resp = await this.transport({
       url,
       method,
       headers: this.headers(),
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if (resp.status < 200 || resp.status >= 300) {
+    if ((resp.status < 200 || resp.status >= 300) && !tolerate?.(resp)) {
       const detail = (resp.text ?? "").slice(0, 500);
       throw new Error(`Hindsight ${method} ${url} → HTTP ${resp.status}: ${detail}`);
     }
@@ -77,9 +89,20 @@ export class HindsightClient {
     await this.send("POST", this.bankUrl(bankId, "/memories"), { items: [item], async: true });
   }
 
-  /** Delete a document and cascade to its memory units. */
+  /**
+   * Delete a document and cascade to its memory units. A document that is already
+   * gone counts as deleted, so sync cleanup converges instead of retrying forever
+   * (#5067). Any other 404 (e.g. a missing bank) still throws.
+   */
   async deleteDocument(bankId: string, documentId: string): Promise<void> {
-    await this.send("DELETE", this.bankUrl(bankId, `/documents/${encodeDocPath(documentId)}`));
+    await this.send(
+      "DELETE",
+      this.bankUrl(bankId, `/documents/${encodeDocPath(documentId)}`),
+      undefined,
+      (resp) =>
+        resp.status === 404 &&
+        (resp.json as { detail?: unknown } | undefined)?.detail === "Document not found"
+    );
   }
 
   async reflect(

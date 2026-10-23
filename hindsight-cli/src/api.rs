@@ -56,7 +56,12 @@ where
         }
         ClientError::InvalidResponsePayload(bytes, src) => {
             let body = String::from_utf8_lossy(&bytes);
-            anyhow::anyhow!("Invalid response payload ({}): {}", src, body)
+            anyhow::anyhow!(
+                "{}: {}\nResponse was: {}",
+                crate::errors::INVALID_RESPONSE_PAYLOAD,
+                src,
+                body
+            )
         }
         other => anyhow::anyhow!("{}", other),
     }
@@ -524,6 +529,29 @@ impl ApiClient {
         })
     }
 
+    pub fn get_document_history(
+        &self,
+        agent_id: &str,
+        document_id: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<types::DocumentHistoryResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_document_history(
+                    agent_id,
+                    document_id,
+                    std::num::NonZeroU64::new(limit.max(1) as u64),
+                    Some(offset as u64),
+                    None, // authorization
+                )
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
     pub fn delete_document(
         &self,
         agent_id: &str,
@@ -935,7 +963,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1011,12 +1039,17 @@ impl ApiClient {
         &self,
         bank_id: &str,
         mental_model_id: &str,
+        full: bool,
         _verbose: bool,
     ) -> Result<types::AsyncOperationSubmitResponse> {
+        // `full` forces a one-off full refresh; the model's stored mode is untouched.
+        let body = types::RefreshMentalModelRequest {
+            mode: full.then(|| "full".to_string()),
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .refresh_mental_model(bank_id, mental_model_id, None)
+                .refresh_mental_model(bank_id, mental_model_id, None, &body)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1515,6 +1548,22 @@ impl ApiClient {
         })
     }
 
+    pub fn get_audit_log(
+        &self,
+        bank_id: &str,
+        log_id: &str,
+        _verbose: bool,
+    ) -> Result<types::AuditLogEntry> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_audit_log(bank_id, log_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
     pub fn audit_log_stats(
         &self,
         bank_id: &str,
@@ -1594,10 +1643,16 @@ impl ApiClient {
         bank_id: &str,
         document_id: &str,
         tags: Option<Vec<String>>,
+        observation_scopes: Option<serde_json::Value>,
         _verbose: bool,
     ) -> Result<types::UpdateDocumentResponse> {
         self.runtime.block_on(async {
-            let request = types::UpdateDocumentRequest { tags };
+            // Through serde so the CLI does not depend on the generated union's variant names.
+            let request: types::UpdateDocumentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "tags": tags,
+                    "observation_scopes": observation_scopes,
+                }))?;
             let response = self
                 .client
                 .update_document(bank_id, document_id, None, &request)

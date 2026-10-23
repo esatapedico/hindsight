@@ -107,6 +107,9 @@ import type {
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
+  GetAuditLogData,
+  GetAuditLogErrors,
+  GetAuditLogResponses,
   GetBankAttachmentData,
   GetBankAttachmentErrors,
   GetBankAttachmentResponses,
@@ -126,6 +129,9 @@ import type {
   GetDirectiveResponses,
   GetDocumentData,
   GetDocumentErrors,
+  GetDocumentHistoryData,
+  GetDocumentHistoryErrors,
+  GetDocumentHistoryResponses,
   GetDocumentResponses,
   GetEntityData,
   GetEntityErrors,
@@ -400,7 +406,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.
+ * List memory units with pagination and an optional substring filter (`q`). Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -747,7 +753,7 @@ export const getMentalModelHistory = <ThrowOnError extends boolean = false>(
 /**
  * Refresh mental model
  *
- * Submit an async task to re-run the source query through reflect and update the content.
+ * Submit an async task to re-run the source query through reflect and update the content. With no body the refresh runs in the model's own `trigger.mode`. Send `{"mode": "full"}` for a full refresh: the content is regenerated from scratch this once (to clear the drift delta edits accumulate) while the stored trigger keeps its mode. Unlike clearing the model first, a full refresh that fails leaves the previous content in place.
  */
 export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   options: Options<RefreshMentalModelData, ThrowOnError>
@@ -756,7 +762,14 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
     RefreshMentalModelResponses,
     RefreshMentalModelErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Dry-run mental model refresh (preview, no persistence)
@@ -1025,6 +1038,22 @@ export const listDocumentChunks = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}/chunks", ...options });
 
 /**
+ * Get document change history
+ *
+ * What each change to a document did, newest first: every retain, append and reprocess (facts added and removed), every fact edit, invalidation, restore, delete, retag and per-fact observation clear (observations removed), and every consolidation run (observations created, updated and removed). Observations are rebuilt, not versioned, so this is the only record of the ones a change removed. Ids and counts only, with each id list capped at 100.
+ *
+ * Rebuilt from the bank's async operations, which carry these events: it reaches back only as far as operations are kept (HINDSIGHT_API_OPERATION_RETENTION_DAYS, unlimited by default), and a change that ran without an operation is not in it — a synchronous retain (async=false), or a fact edit, delete or retag while auto-consolidation is off. A fact edit, delete or retag is recorded on the consolidation operation it queues. Clearing every observation in the bank is not listed. total, limit and offset count operations, not events.
+ */
+export const getDocumentHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetDocumentHistoryData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    GetDocumentHistoryResponses,
+    GetDocumentHistoryErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}/history", ...options });
+
+/**
  * Reprocess document
  *
  * Re-run the retain pipeline on an existing document without changing its content. This deletes the existing memory units and re-extracts facts using the current engine configuration. Useful when the LLM model, chunking strategy, or extraction settings have changed.
@@ -1078,7 +1107,11 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
  *
- * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
+ * The new tags are propagated to all associated memory units.
+ *
+ * **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
+ *
+ * A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
  *
  * At least one field must be provided.
  */
@@ -1163,7 +1196,7 @@ export const getOperationStatus = <ThrowOnError extends boolean = false>(
 /**
  * Retry a failed async operation
  *
- * Re-queue a failed async operation so the worker picks it up again
+ * Re-queue a failed or cancelled async operation so the worker picks it up again. On a deferred operation (pending with a future next_retry_at), runs it now.
  */
 export const retryOperation = <ThrowOnError extends boolean = false>(
   options: Options<RetryOperationData, ThrowOnError>
@@ -1891,6 +1924,19 @@ export const auditLogStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<AuditLogStatsResponses, AuditLogStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/audit-logs/stats",
+    ...options,
+  });
+
+/**
+ * Get audit log entry
+ *
+ * Get one audit log entry with its full request and response bodies.
+ */
+export const getAuditLog = <ThrowOnError extends boolean = false>(
+  options: Options<GetAuditLogData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/audit-logs/{log_id}",
     ...options,
   });
 

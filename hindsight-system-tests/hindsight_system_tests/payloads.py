@@ -9,6 +9,7 @@ unusable", which is a long walk back to a typo.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from typing import Literal
@@ -74,6 +75,8 @@ class ObservationUpdate(BaseModel):
 
 class ObservationDelete(BaseModel):
     observation_id: str
+    #: The observation that absorbed this one's content; its evidence moves there.
+    merged_into: str | None = None
     reason: str = "system test"
 
 
@@ -122,6 +125,29 @@ def fact_ids_in(prompt: str) -> list[str]:
     return FACT_ID_IN_PROMPT.findall(prompt)
 
 
+def batch_fact_ids(request: "ChatRequest") -> list[str]:
+    """The ids of the facts this consolidation call is about — the batch, not the
+    worked examples the system prompt also writes as ``[uuid] text``."""
+    text = request.user_text
+    return fact_ids_in(text[text.rfind("### New facts") : text.rfind("### Existing observations")])
+
+
+def batch_fact_id(request: "ChatRequest", needle: str) -> str | None:
+    """The id of the batch fact whose text contains ``needle``, if it is in this batch."""
+    text = request.user_text
+    facts = text[text.rfind("### New facts") : text.rfind("### Existing observations")]
+    return next((line[1:37] for line in facts.splitlines() if line.startswith("[") and needle in line), None)
+
+
+def shown_observations(request: "ChatRequest") -> dict[str, str]:
+    """``{text: id}`` of the existing observations this call was shown."""
+    text = request.user_text
+    shown = text[text.rfind("### Existing observations") + len("### Existing observations") :].strip()
+    if not shown.startswith("["):
+        return {}
+    return {o["text"]: o["id"] for o in json.loads(shown[: shown.rindex("]") + 1])}
+
+
 def observes(text: str) -> Callable[["ChatRequest"], Consolidation]:
     """A consolidation reply drawing one observation from every fact in the prompt.
 
@@ -136,3 +162,21 @@ def observes(text: str) -> Callable[["ChatRequest"], Consolidation]:
         )
 
     return build
+
+
+class AddSection(BaseModel):
+    """One operation of a delta refresh's edit: a new section at the end of the page."""
+
+    op: Literal["add_section"] = "add_section"
+    heading: str
+    blocks: list[str]
+
+
+class DeltaOperations(BaseModel):
+    """What a delta knowledge-page refresh's edit call returns."""
+
+    operations: list[AddSection]
+
+
+def add_section(heading: str, *blocks: str) -> DeltaOperations:
+    return DeltaOperations(operations=[AddSection(heading=heading, blocks=list(blocks))])

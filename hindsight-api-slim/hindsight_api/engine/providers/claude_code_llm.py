@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from hindsight_api.engine.llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
@@ -29,6 +29,7 @@ from hindsight_api.engine.llm_interface import (
     ProviderRateLimitResetError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema
@@ -40,12 +41,51 @@ from ..response_models import LLMCallResult
 logger = logging.getLogger(__name__)
 
 
+class _SdkUsage(BaseModel):
+    """The Anthropic-shaped usage block the CLI reports on its messages."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+
+
+def _sdk_token_usage(usage: dict[str, Any] | None, messages: list[dict[str, Any]], text: str) -> TokenUsage:
+    """Token counts from the usage block the CLI reports.
+
+    Anthropic counts cache reads and writes apart from ``input_tokens``; the
+    ``TokenUsage`` contract counts them in it, with reads also in ``cached_tokens``.
+    Falls back to a char/4 estimate when the run reported no usage.
+    """
+    if not usage:
+        estimated_input = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        estimated_output = len(text) // 4
+        return TokenUsage(
+            input_tokens=estimated_input,
+            output_tokens=estimated_output,
+            total_tokens=estimated_input + estimated_output,
+        )
+    parsed = _SdkUsage.model_validate(usage)
+    cache_read = parsed.cache_read_input_tokens or 0
+    input_tokens = (parsed.input_tokens or 0) + cache_read + (parsed.cache_creation_input_tokens or 0)
+    output_tokens = parsed.output_tokens or 0
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cached_tokens=cache_read,
+    )
+
+
 # Isolation env passed to the spawned `claude` CLI. CLAUDE_CONFIG_DIR
 # redirects the subprocess away from the host's ~/.claude/, so any
 # operator-installed plugins (e.g. hindsight-memory) and their Stop hooks do
 # not fire inside our LLM-call subprocesses. Without this, retain/reflect/
 # consolidation LLM calls would trigger a Stop-hook retain of the subprocess
 # transcript back into the same bank — a recursive feedback loop (issue #1751).
+# This only covers *user* settings: the call sites also pin cwd to this dir and
+# pass setting_sources=[], or project settings from the daemon's cwd reopen the
+# same loop (issue #5542).
 # CLAUDE_SECURESTORAGE_CONFIG_DIR="" forces the CLI's keychain service name
 # back to the canonical un-suffixed entry that `claude auth login` wrote;
 # otherwise it would be namespaced by sha256(CLAUDE_CONFIG_DIR) and OAuth
@@ -211,6 +251,14 @@ class ClaudeCodeLLM(LLMInterface):
                 "CLAUDE_CODE_OAUTH_TOKEN from config" if "CLAUDE_CODE_OAUTH_TOKEN" in self._env else "claude auth login"
             )
             logger.info(f"Claude Code: Using Claude Agent SDK (authentication via {auth})")
+            # Automated calls on a Claude subscription may conflict with Anthropic's
+            # terms; point operators at the docs notice rather than starting silently (#5444).
+            logger.warning(
+                "Claude Code provider runs automated model calls on your Claude subscription, which may "
+                "conflict with Anthropic's terms. Read the notice before using it beyond personal local "
+                "development, and prefer the 'anthropic' provider with an API key for servers: "
+                "https://hindsight.vectorize.io/developer/models#claude-code-setup-claude-promax"
+            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize Claude Code provider: {e}\n\n"
@@ -317,7 +365,7 @@ class ClaudeCodeLLM(LLMInterface):
             query,
         )
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Build system prompt
         system_prompt = ""
@@ -363,11 +411,19 @@ class ClaudeCodeLLM(LLMInterface):
             # Pin the configured model (issue #2881). Without this the spawned CLI
             # runs its own default model — an Opus-class model on Pro/Max OAuth —
             # regardless of HINDSIGHT_API_*_LLM_MODEL, while metrics/logs still print
-            # self.model, so the mismatch is invisible. The isolated CLAUDE_CONFIG_DIR
-            # (fresh temp dir) means a host settings.json can't reach the CLI either,
-            # so passing it through here is the only channel.
+            # self.model, so the mismatch is invisible. The CLI loads no settings
+            # files (setting_sources=[] below), so a host settings.json can't set the
+            # model either: passing it through here is the only channel.
             model=self.model or None,
             env=self._env,
+            # CLAUDE_CONFIG_DIR only moves *user* settings. The CLI still loads
+            # ./.claude/settings.json from its cwd as project settings, and the
+            # subprocess inherits the daemon's cwd: started from $HOME, that file
+            # IS ~/.claude/settings.json with the host's hooks, and the #1751
+            # loop comes back (issue #5542). Run in the empty isolated dir and
+            # load no settings files at all.
+            cwd=self._env["CLAUDE_CONFIG_DIR"],
+            setting_sources=[],
         )
 
         # Call Claude Agent SDK
@@ -376,6 +432,7 @@ class ClaudeCodeLLM(LLMInterface):
             try:
                 # Collect streaming response
                 full_text = ""
+                sdk_usage: dict[str, Any] | None = None
 
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.claude_code.{scope}.attempt={attempt + 1}/{max_retries + 1}")
@@ -384,19 +441,23 @@ class ClaudeCodeLLM(LLMInterface):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
                                     full_text += block.text
-                        elif isinstance(message, ResultMessage) and message.is_error:
-                            # Surface the CLI's actual error text (e.g. quota
-                            # exhaustion) instead of the SDK's subtype-based
-                            # fallback exception (issue #2702).
-                            raise _result_error(message)
+                        elif isinstance(message, ResultMessage):
+                            if message.is_error:
+                                # Surface the CLI's actual error text (e.g. quota
+                                # exhaustion) instead of the SDK's subtype-based
+                                # fallback exception (issue #2702).
+                                raise _result_error(message)
+                            # The run's total usage, as the CLI billed it.
+                            sdk_usage = message.usage
 
-                # The Claude Agent SDK doesn't report exact counts; stash the same
-                # char/4 estimate the success path traces so a later parse/validate
-                # failure records consistent (estimated) tokens, not zero (#2387).
+                # Stashed before parsing so a later parse/validate failure traces
+                # the same counts the success path does (#2387).
+                token_usage = _sdk_token_usage(sdk_usage, messages, full_text)
                 stash_response_usage(
                     LLMResponseUsage(
-                        input_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
-                        output_tokens=len(full_text) // 4,
+                        input_tokens=token_usage.input_tokens,
+                        output_tokens=token_usage.output_tokens,
+                        cached_tokens=token_usage.cached_tokens,
                     )
                 )
 
@@ -414,7 +475,13 @@ class ClaudeCodeLLM(LLMInterface):
                             await asyncio.sleep(backoff)
                             last_exception = e
                             continue
-                        raise
+                        # Retry budget spent: structural repair as a last resort, as
+                        # openai_compatible_llm.py does since #3935. A quotation copied
+                        # verbatim leaves an unescaped inner '"' that every retry
+                        # reproduces (#5472). We only get here after the CLI's
+                        # ResultMessage arrived without an error, so the body is complete.
+                        # Raises JSONDecodeError again if unrecoverable.
+                        json_data = parse_llm_json(full_text)
 
                     if skip_validation:
                         result = json_data
@@ -424,22 +491,18 @@ class ClaudeCodeLLM(LLMInterface):
                     result = full_text
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
-
-                # Estimate token usage (Claude Agent SDK doesn't report exact counts)
-                # Use character count / 4 as rough estimate (1 token ≈ 4 characters)
-                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                estimated_output = len(full_text) // 4
 
                 metrics.record_llm_call(
                     provider=self.provider,
                     model=self.model,
                     scope=scope,
                     duration=duration,
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
+                    input_tokens=token_usage.input_tokens,
+                    output_tokens=token_usage.output_tokens,
                     success=True,
+                    cached_input_tokens=token_usage.cached_tokens,
                 )
 
                 # Record trace span
@@ -453,11 +516,12 @@ class ClaudeCodeLLM(LLMInterface):
                         scope=scope,
                         messages=messages,
                         response_content=_serialize_for_span(result),
-                        input_tokens=estimated_input,
-                        output_tokens=estimated_output,
+                        input_tokens=token_usage.input_tokens,
+                        output_tokens=token_usage.output_tokens,
                         duration=duration,
                         finish_reason=None,
                         error=None,
+                        cached_tokens=token_usage.cached_tokens,
                     )
                 except Exception as span_error:
                     # Tracing must remain best-effort, but expose instrumentation
@@ -470,11 +534,6 @@ class ClaudeCodeLLM(LLMInterface):
                         f"slow llm call: scope={scope}, model={self.provider}/{self.model}, time={duration:.3f}s"
                     )
 
-                token_usage = TokenUsage(
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                    total_tokens=estimated_input + estimated_output,
-                )
                 return LLMCallResult(content=result, usage=token_usage)
 
             except ValidationError:
@@ -561,7 +620,7 @@ class ClaudeCodeLLM(LLMInterface):
             create_sdk_mcp_server,
         )
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Convert OpenAI tool format to Claude Agent SDK SdkMcpTool format
         sdk_tools: list[SdkMcpTool] = []
@@ -691,6 +750,9 @@ class ClaudeCodeLLM(LLMInterface):
             # Pin the configured model (issue #2881) — see the call() options block.
             model=self.model or None,
             env=self._env,
+            # No host settings/hooks via the daemon's cwd (#5542) — see call().
+            cwd=self._env["CLAUDE_CONFIG_DIR"],
+            setting_sources=[],
         )
 
         # Call Claude Agent SDK with retry logic
@@ -699,6 +761,7 @@ class ClaudeCodeLLM(LLMInterface):
             try:
                 full_text = ""
                 tool_calls: list[LLMToolCall] = []
+                sdk_usage: dict[str, Any] | None = None
 
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.claude_code.tools.attempt={attempt + 1}/{max_retries + 1}")
@@ -711,6 +774,9 @@ class ClaudeCodeLLM(LLMInterface):
                         # Receive response
                         async for message in client.receive_response():
                             if isinstance(message, AssistantMessage):
+                                # A round that proposes tool calls stops before the
+                                # ResultMessage, so keep the API message's own usage.
+                                sdk_usage = message.usage or sdk_usage
                                 for block in message.content:
                                     if isinstance(block, TextBlock):
                                         full_text += block.text
@@ -743,24 +809,47 @@ class ClaudeCodeLLM(LLMInterface):
                                 # error with nothing to return should surface (issue #2702).
                                 if not tool_calls:
                                     raise _result_error(message)
+                            elif isinstance(message, ResultMessage):
+                                sdk_usage = message.usage or sdk_usage
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
 
-                # Estimate token usage (Claude Agent SDK doesn't report exact counts)
-                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                estimated_output = len(full_text) // 4
+                token_usage = _sdk_token_usage(sdk_usage, messages, full_text)
 
                 metrics.record_llm_call(
                     provider=self.provider,
                     model=self.model,
                     scope=scope,
                     duration=duration,
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
+                    input_tokens=token_usage.input_tokens,
+                    output_tokens=token_usage.output_tokens,
                     success=True,
+                    cached_input_tokens=token_usage.cached_tokens,
                 )
+
+                # Record trace span. The wrapper records only failed calls, so without
+                # this a successful tool round never reaches the traces (#5381).
+                try:
+                    from hindsight_api.tracing import get_span_recorder
+
+                    get_span_recorder().record_llm_call(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        response_content=full_text or None,
+                        input_tokens=token_usage.input_tokens,
+                        output_tokens=token_usage.output_tokens,
+                        cached_tokens=token_usage.cached_tokens,
+                        duration=duration,
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                        error=None,
+                        tool_calls=[{"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls] or None,
+                    )
+                except Exception as span_error:
+                    logger.debug("Claude Code span recording failed: %s", span_error, exc_info=True)
 
                 # Log slow calls
                 if duration > 10.0:
@@ -772,8 +861,9 @@ class ClaudeCodeLLM(LLMInterface):
                     content=full_text if full_text else None,
                     tool_calls=tool_calls,
                     finish_reason="tool_calls" if tool_calls else "stop",
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
+                    input_tokens=token_usage.input_tokens,
+                    output_tokens=token_usage.output_tokens,
+                    cached_tokens=token_usage.cached_tokens,
                 )
 
             except (ProviderContentPolicyError, ProviderRateLimitResetError):

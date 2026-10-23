@@ -28,6 +28,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from ..db.ops_postgresql import PostgreSQLOps
 from ..retain.types import EmbeddingLike, EntityResolutionResult
 from ..schema import fq_store_table, fq_store_table_explicit
 from ..search.tags import TagGroup, TagsMatch
@@ -51,6 +52,7 @@ from .base import (
     RecallArms,
     RelabelResult,
     RelinkPassResult,
+    RetagResult,
     ScanPage,
     SemanticBm25Result,
     StoredMemory,
@@ -516,6 +518,33 @@ class PostgresMemories(MemoriesExtension):
             tag_groups=tag_groups,
         )
 
+    async def memories_updated_between(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        until: datetime,
+        since: datetime,
+        limit: int,
+        fact_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list | None = None,
+    ) -> list[StoredMemory] | None:
+        return await reads.memories_updated_between(
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            until=until,
+            since=since,
+            limit=limit,
+            fact_types=fact_types,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+        )
+
     async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
         return await reads.latest_memory_write_at(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
 
@@ -936,11 +965,24 @@ class PostgresMemories(MemoriesExtension):
         )
 
     async def update_document_tags(
-        self, *, conn, fq_table, bank_id: str, document_id: str, tags: list[str] | None, found: bool
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        document_id: str,
+        tags: list[str] | None,
+        found: bool,
+        observation_scopes: list | str | None = None,
     ) -> bool:
         """``found`` is not needed: the UPDATE's RETURNING says whether the row exists."""
         return await documents.update_document_tags(
-            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, tags=tags
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            document_id=document_id,
+            tags=tags,
+            observation_scopes=observation_scopes,
         )
 
     async def retag_document_memories(
@@ -951,10 +993,10 @@ class PostgresMemories(MemoriesExtension):
         fq_table,
         bank_id: str,
         document_id: str,
-        tags: list[str],
+        tags: list[str] | None,
         retagged: Callable[[list[str] | None], list[str]],
         rescoped: Callable[[Any], str | None],
-    ) -> int:
+    ) -> RetagResult:
         return await documents.retag_document_memories(
             conn=conn,
             ops=ops,
@@ -1153,6 +1195,9 @@ class PostgresMemories(MemoriesExtension):
         await pg_retain.lock_pending_document(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
         )
+
+    async def lock_document_row(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
+        await pg_retain.lock_document_hash(conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id)
 
     async def lock_document_hash(self, *, conn, fq_table, bank_id: str, document_id: str) -> str | None:
         return await pg_retain.lock_document_hash(
@@ -1440,6 +1485,13 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=unit_ids
         )
 
+    async def lock_consolidation_write_set(
+        self, *, conn, fq_table, bank_id: str, fact_ids: list[str], observation_ids: list[str]
+    ) -> None:
+        await pg_consolidation.lock_consolidation_write_set(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, fact_ids=fact_ids, observation_ids=observation_ids
+        )
+
     async def lock_observation_tags(self, *, conn, fq_table, bank_id: str, observation_id: str) -> list[str] | None:
         return await pg_consolidation.lock_observation_tags(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, observation_id=observation_id
@@ -1625,11 +1677,21 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_index=unit_index
         )
 
-    async def dump_entity_maintenance_queue(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        return await pg_transfer.dump_entity_maintenance_queue(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
+    async def iter_entity_maintenance_queue(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        async for page in pg_transfer.iter_entity_maintenance_queue(
+            backend=backend, fq_table=fq_store_table, bank_id=bank_id, page_size=page_size
+        ):
+            yield page
 
-    async def dump_archived_memories(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        return await pg_transfer.dump_archived_memories(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
+    async def iter_archived_memories(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        async for page in pg_transfer.iter_archived_memories(
+            backend=backend, fq_table=fq_store_table, bank_id=bank_id, page_size=page_size
+        ):
+            yield page
 
     async def restore_archived_memories(
         self,
@@ -1760,6 +1822,17 @@ class PostgresMemories(MemoriesExtension):
             bank_id=bank_id,
             old_key=old_key,
             new_key=new_key,
+        )
+
+    async def admin_sweep_orphan_observations(self, *, conn, schema: str, bank_id: str, dry_run: bool) -> int:
+        """Delete the bank's observations citing a missing source (repair-bank); how many."""
+        return await pg_admin.sweep_orphan_observations(
+            conn=conn,
+            ops=PostgreSQLOps(),
+            fq_table_explicit=fq_store_table_explicit,
+            schema=schema,
+            bank_id=bank_id,
+            dry_run=dry_run,
         )
 
 

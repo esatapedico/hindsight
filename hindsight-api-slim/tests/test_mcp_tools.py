@@ -1274,6 +1274,14 @@ class TestRecallNewParams:
         call_kwargs = mock_memory.recall_async.call_args.kwargs
         assert call_kwargs["budget"] == Budget.LOW
 
+    async def test_recall_prefer_observations_defers_to_bank(self, mock_memory):
+        """Omitted → None, so the engine applies the bank's recall_prefer_observations."""
+        mcp = _make_mcp_server(mock_memory, {"recall"})
+        await _tools(mcp)["recall"].fn(query="test")
+        assert mock_memory.recall_async.call_args.kwargs["prefer_observations"] is None
+        await _tools(mcp)["recall"].fn(query="test", prefer_observations=False)
+        assert mock_memory.recall_async.call_args.kwargs["prefer_observations"] is False
+
     async def test_recall_with_types(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"recall"})
         await _tools(mcp)["recall"].fn(query="test", types=["world"])
@@ -1345,6 +1353,35 @@ class TestRecallNewParams:
         call_kwargs = mock_memory.recall_async.call_args.kwargs
         assert "tag_groups" in call_kwargs
         assert len(call_kwargs["tag_groups"]) == 1
+
+    async def test_recall_include_options_off_by_default(self, mock_memory):
+        mcp = _make_mcp_server(mock_memory, {"recall"})
+        await _tools(mcp)["recall"].fn(query="test")
+        call_kwargs = mock_memory.recall_async.call_args.kwargs
+        assert call_kwargs["include_chunks"] is False
+        assert call_kwargs["include_entities"] is False
+        assert call_kwargs["include_source_facts"] is False
+
+    @pytest.mark.parametrize("include_bank_id", [True, False])
+    async def test_recall_include_options_passed_through(self, mock_memory, include_bank_id):
+        """Issue #5470: MCP recall must be able to return source chunks, entities and source facts."""
+        mcp = _make_mcp_server(mock_memory, {"recall"}, include_bank_id=include_bank_id)
+        await _tools(mcp)["recall"].fn(
+            query="test",
+            include_chunks=True,
+            max_chunk_tokens=6000,
+            include_entities=True,
+            max_entity_tokens=300,
+            include_source_facts=True,
+            max_source_facts_tokens=1000,
+        )
+        call_kwargs = mock_memory.recall_async.call_args.kwargs
+        assert call_kwargs["include_chunks"] is True
+        assert call_kwargs["max_chunk_tokens"] == 6000
+        assert call_kwargs["include_entities"] is True
+        assert call_kwargs["max_entity_tokens"] == 300
+        assert call_kwargs["include_source_facts"] is True
+        assert call_kwargs["max_source_facts_tokens"] == 1000
 
 
 @pytest.mark.asyncio
@@ -1586,10 +1623,15 @@ class TestMemoryBrowsingTools:
     async def test_update_memory_edits_fields(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"update_memory"}, include_bank_id=True)
         await _tools(mcp)["update_memory"].fn(
-            memory_id="mem-1", text="corrected", fact_type="experience", entities=["Alice"]
+            memory_id="mem-1",
+            text="corrected",
+            fact_type="experience",
+            entities=["Alice"],
+            mentioned_at="2019-05-01",
         )
         call_kwargs = mock_memory.update_memory_unit.call_args.kwargs
         assert call_kwargs["text"] == "corrected"
+        assert call_kwargs["mentioned_at"] == "2019-05-01"
         assert call_kwargs["new_fact_type"] == "experience"
         assert call_kwargs["entities"] == ["Alice"]
         # update_memory does not change state — that's invalidate_memory's job.
@@ -1777,6 +1819,34 @@ class TestListToolBounds:
         mcp = _make_mcp_server(mock_memory, {"list_operations"}, include_bank_id=True)
         await mcp.call_tool("list_operations", {"limit": 100})
         assert mock_memory.list_operations.call_args.kwargs["limit"] == 100
+
+
+@pytest.mark.asyncio
+class TestRecallReflectTagsMatch:
+    """#5371: an unknown tags_match is rejected instead of silently running as "any"."""
+
+    @pytest.fixture
+    def mock_memory(self, mock_memory):
+        mock_memory._config_resolver.get_bank_config = AsyncMock(return_value={})
+        mock_memory._operation_validator = None
+        mock_memory.audit_logger.action_allowed = MagicMock(return_value=False)
+        return mock_memory
+
+    @pytest.mark.parametrize("include_bank_id", [True, False])
+    @pytest.mark.parametrize("tool", ["recall", "reflect"])
+    async def test_unknown_mode_is_rejected(self, mock_memory, tool, include_bank_id):
+        from pydantic import ValidationError
+
+        mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=include_bank_id)
+        with pytest.raises(ValidationError):
+            await mcp.call_tool(tool, {"query": "q", "tags": ["typescript"], "tags_match": "any-strict"})
+        getattr(mock_memory, f"{tool}_async").assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["recall", "reflect"])
+    async def test_schema_lists_all_modes(self, mock_memory, tool):
+        mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=True)
+        schema = _tools(mcp)[tool].parameters["properties"]["tags_match"]
+        assert set(schema["enum"]) == {"any", "all", "any_strict", "all_strict", "exact"}
 
 
 # =========================================================================
@@ -2763,3 +2833,48 @@ class TestRecallResponseSize:
         # An agent sizes its context from this line, so it must say what the budget covers.
         assert "'text' counts" in max_tokens_doc
         assert "several times larger" in max_tokens_doc
+
+
+@pytest.mark.asyncio
+class TestMcpCallLogging:
+    """#5960: every tool call names the tool, destructive ones log with audit off, writes are audited."""
+
+    @pytest.fixture
+    def mock_memory(self, mock_memory):
+        from hindsight_api.engine.audit import AuditLogger
+
+        mock_memory._config_resolver.get_bank_config = AsyncMock(return_value={})
+        mock_memory._operation_validator = None
+        mock_memory.audit_logger = AuditLogger(
+            pool_getter=lambda: None, schema_getter=lambda: "tenant_x", enabled=False, allowed_actions=[]
+        )
+        return mock_memory
+
+    async def test_delete_bank_logged_with_audit_disabled(self, mock_memory, caplog):
+        mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=False)
+        with caplog.at_level("INFO"):
+            await mcp.call_tool("delete_bank", {})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            m.startswith("destructive_op action=delete_bank bank=test-bank transport=mcp")
+            and "schema=tenant_x" in m
+            and "status=ok" in m
+            for m in messages
+        ), messages
+        assert any(m.startswith("mcp tool=delete_bank bank=test-bank status=ok") for m in messages), messages
+
+    async def test_read_tool_named_but_not_destructive(self, mock_memory, caplog):
+        mcp = _make_mcp_server(mock_memory, {"list_tags"}, include_bank_id=False)
+        with caplog.at_level("INFO"):
+            await mcp.call_tool("list_tags", {})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith("mcp tool=list_tags bank=test-bank status=ok") for m in messages), messages
+        assert not any(m.startswith("destructive_op") for m in messages)
+
+    async def test_write_tool_missing_from_old_allowlist_is_audited(self, mock_memory):
+        mock_memory.audit_logger._enabled = True
+        mock_memory.audit_logger.log_fire_and_forget = MagicMock()
+        mcp = _make_mcp_server(mock_memory, {"sync_retain"}, include_bank_id=False)
+        await mcp.call_tool("sync_retain", {"content": "hello"})
+        entry = mock_memory.audit_logger.log_fire_and_forget.call_args.args[0]
+        assert (entry.action, entry.transport, entry.bank_id) == ("sync_retain", "mcp", "test-bank")

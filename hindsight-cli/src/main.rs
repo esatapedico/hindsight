@@ -116,7 +116,7 @@ enum Commands {
     #[command(subcommand)]
     Webhook(WebhookCommands),
 
-    /// Inspect audit logs (list, stats)
+    /// Inspect audit logs (list, get, stats)
     #[command(subcommand)]
     Audit(AuditCommands),
 
@@ -510,7 +510,7 @@ enum MemoryCommands {
         #[arg(short = 't', long)]
         fact_type: Option<String>,
 
-        /// Full-text search query
+        /// Substring filter on memory text and context (unindexed scan, for browsing; use recall to search)
         #[arg(short = 'q', long)]
         query: Option<String>,
 
@@ -576,9 +576,9 @@ enum MemoryCommands {
         #[arg(long)]
         query_timestamp: Option<String>,
 
-        /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled)
-        #[arg(long)]
-        prefer_observations: bool,
+        /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled). Bare flag = true, `--prefer-observations=false` to turn off; omitted = bank default
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        prefer_observations: Option<bool>,
 
         /// Start of the time window to search over (ISO 8601; no offset means UTC). Requires --window-end
         #[arg(long)]
@@ -773,6 +773,23 @@ enum DocumentCommands {
         document_id: String,
     },
 
+    /// Show what each change did to a document's facts and observations (rebuilt from operations)
+    History {
+        /// Bank ID
+        bank_id: String,
+
+        /// Document ID
+        document_id: String,
+
+        /// Maximum number of operations to read
+        #[arg(short = 'l', long, default_value = "50")]
+        limit: i32,
+
+        /// Offset for pagination, in operations
+        #[arg(short = 's', long, default_value = "0")]
+        offset: i32,
+    },
+
     /// Delete a document and all its memory units
     Delete {
         /// Bank ID
@@ -782,7 +799,7 @@ enum DocumentCommands {
         document_id: String,
     },
 
-    /// Update a document (currently only supports replacing tags)
+    /// Update a document's tags or observation scopes without re-extracting it
     Update {
         /// Bank ID
         bank_id: String,
@@ -794,6 +811,11 @@ enum DocumentCommands {
         /// invalidation + re-consolidation.
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+
+        /// New observation scopes: per_tag, combined, all_combinations, shared, or a JSON list
+        /// of tag lists (e.g. '[["user:alice"]]'). Memories whose scopes move are re-consolidated.
+        #[arg(long)]
+        observation_scopes: Option<String>,
     },
 }
 
@@ -994,6 +1016,15 @@ enum AuditCommands {
         offset: Option<u64>,
     },
 
+    /// Show one audit log entry with its full request and response
+    Get {
+        /// Bank ID
+        bank_id: String,
+
+        /// Audit log entry ID (from `audit list`)
+        log_id: String,
+    },
+
     /// Show audit log statistics bucketed over time
     Stats {
         /// Bank ID
@@ -1135,6 +1166,13 @@ enum MentalModelCommands {
         #[arg(long)]
         trigger_refresh_cron: Option<String>,
 
+        /// Cron expression (UTC, 5-field, e.g. '0 3 * * 0') for a scheduled
+        /// FULL refresh of a delta model: on this schedule the content is
+        /// rewritten from scratch, independent of the other triggers and
+        /// without changing the mode. Empty string removes the schedule
+        #[arg(long)]
+        trigger_full_refresh_cron: Option<String>,
+
         /// Minimum seconds between two automatic refreshes (0 disables the floor)
         #[arg(long)]
         trigger_min_refresh_interval_seconds: Option<u64>,
@@ -1174,6 +1212,11 @@ enum MentalModelCommands {
 
         /// Mental model ID
         mental_model_id: String,
+
+        /// Rewrite the content from scratch this once (a full refresh), whatever
+        /// the model's mode; the mode itself is not changed
+        #[arg(long)]
+        full: bool,
     },
 
     /// Preview a refresh without changing the mental model
@@ -1851,6 +1894,19 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
             } => commands::document::get(&client, &bank_id, &document_id, verbose, output_format),
+            DocumentCommands::History {
+                bank_id,
+                document_id,
+                limit,
+                offset,
+            } => commands::document::history(
+                &client,
+                &bank_id,
+                &document_id,
+                limit,
+                offset,
+                output_format,
+            ),
             DocumentCommands::Delete {
                 bank_id,
                 document_id,
@@ -1861,6 +1917,7 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
                 tags,
+                observation_scopes,
             } => {
                 // `--tags ""` parses as one empty tag; drop blanks so it clears the set
                 // instead of storing "".
@@ -1870,6 +1927,7 @@ fn run() -> Result<()> {
                     &bank_id,
                     &document_id,
                     tags,
+                    observation_scopes,
                     verbose,
                     output_format,
                 )
@@ -2002,6 +2060,7 @@ fn run() -> Result<()> {
                 trigger_refresh_after_consolidation,
                 trigger_mode,
                 trigger_refresh_cron,
+                trigger_full_refresh_cron,
                 trigger_min_refresh_interval_seconds,
                 trigger_tags_match,
                 trigger_keep_trace,
@@ -2018,6 +2077,7 @@ fn run() -> Result<()> {
                     mode: trigger_mode,
                     refresh_after_consolidation: trigger_refresh_after_consolidation,
                     refresh_cron: trigger_refresh_cron,
+                    full_refresh_cron: trigger_full_refresh_cron,
                     min_refresh_interval_seconds: trigger_min_refresh_interval_seconds,
                     tags_match: trigger_tags_match,
                     keep_trace: trigger_keep_trace,
@@ -2041,10 +2101,12 @@ fn run() -> Result<()> {
             MentalModelCommands::Refresh {
                 bank_id,
                 mental_model_id,
+                full,
             } => commands::mental_model::refresh(
                 &client,
                 &bank_id,
                 &mental_model_id,
+                full,
                 verbose,
                 output_format,
             ),
@@ -2324,6 +2386,9 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+            AuditCommands::Get { bank_id, log_id } => {
+                commands::audit::get(&client, &bank_id, &log_id, verbose, output_format)
+            }
             AuditCommands::Stats {
                 bank_id,
                 action,

@@ -197,6 +197,7 @@ Mental models can be configured to **automatically refresh** when observations a
 | `mode` | `"full"` \| `"delta"` | `"full"` | Refresh strategy. See [Refresh Mode](#refresh-mode) below. |
 | `refresh_after_consolidation` | bool | false | Automatically refresh after observations consolidation |
 | `refresh_cron` | string \| null | null | UTC 5-field cron expression for scheduled refreshes, such as `"0 3 * * *"` for daily at 03:00 UTC |
+| `full_refresh_cron` | string \| null | null | UTC 5-field cron expression for a scheduled **full** refresh of a delta model, such as `"0 3 * * 0"` for Sundays at 03:00 UTC. Works alongside either trigger above. See [Scheduled Full Refresh](#scheduled-full-refresh). |
 | `min_refresh_interval_seconds` | int \| null | null | Minimum seconds between two *automatic* refreshes of this model. See [Rate-limiting automatic refreshes](#rate-limiting-automatic-refreshes) below. `null` uses the bank/global default. |
 | `tags_match` | string \| null | null | How the model's `tags` filter source memories during refresh: `any`, `all`, `any_strict`, `all_strict`, or `exact`. When `null`, a **tagged** model defaults to `all_strict` (a memory must carry every one of the model's tags). Set `"any"` to match memories carrying *any* of the tags — see [Tags and Visibility](#tags-and-visibility). |
 | `tag_groups` | list \| null | null | Advanced boolean tag expressions that override flat `tags`/`tags_match` entirely. See the [Recall tags reference](./recall.md#tags). |
@@ -218,7 +219,7 @@ When `refresh_cron` is set, Hindsight checks the schedule on the server's mental
 
 `last_refresh_failed_at` on the model (and on a page in the knowledge tree) carries when that happened, so a list view can show which models have stopped refreshing themselves without reading each one's history.
 
-**A failed refresh pauses the automatic ones.** A failed refresh is retried by the worker (`HINDSIGHT_API_WORKER_MAX_RETRIES`, 3 by default) and then stops. Neither `refresh_after_consolidation` nor `refresh_cron` queues that model again until a refresh succeeds, so a refresh that cannot work (a prompt too large for the model, an empty account, a delta that will not apply) costs a few attempts instead of an LLM bill every tick. The failure shows in the model's [history](#history). Fix the cause and refresh the model yourself: a successful refresh resumes the automatic ones. A refresh cut off by `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, which bounds a whole refresh the same way it bounds a reflect, counts as a failure too.
+**A failed refresh pauses the automatic ones.** A failed refresh is retried by the worker (`HINDSIGHT_API_WORKER_MAX_RETRIES`, 3 by default) and then stops. None of `refresh_after_consolidation`, `refresh_cron` or `full_refresh_cron` queues that model again until a refresh succeeds, so a refresh that cannot work (a prompt too large for the model, an empty account, a delta that will not apply) costs a few attempts instead of an LLM bill every tick. The failure shows in the model's [history](#history). Fix the cause and refresh the model yourself: a successful refresh resumes the automatic ones. A refresh cut off by `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, which bounds a whole refresh the same way it bounds a reflect, counts as a failure too.
 
 ### Rate-limiting automatic refreshes
 
@@ -244,8 +245,8 @@ queued refresh — so a burst of twenty retains costs one refresh, and that refr
 reads everything the twenty retains added. The only thing you trade away is immediacy: the
 model can lag its memories by up to the interval.
 
-The floor applies to both automatic triggers (`refresh_after_consolidation` and
-`refresh_cron`). It never applies to a refresh you ask for — the refresh endpoint, the MCP
+The floor applies to every automatic trigger (`refresh_after_consolidation`,
+`refresh_cron` and `full_refresh_cron`). It never applies to a refresh you ask for — the refresh endpoint, the MCP
 tool, and the control plane's refresh button all run immediately, and additionally release a
 parked refresh if one is waiting.
 
@@ -304,7 +305,7 @@ Listing does not cost one query per model — the whole page is answered togethe
 - **Only what's new, in `delta` mode.** A delta refresh scopes its retrieval to memories created since the last refresh, so the LLM reads genuinely new information rather than re-reading the whole bank.
 - **Cumulative grounding.** Even in delta mode, `reflect_response.based_on` accumulates: the facts from this refresh are merged with everything previous refreshes relied on, deduplicated by id. The document rests on all of them, not just the latest slice.
 - **Nothing, if nothing is relevant.** A refresh that finds no topic-relevant memories leaves the content alone and only advances the watermark, so the same empty window stops re-triggering.
-- **No LLM call at all, if there is nothing to read.** Before the agentic loop starts, a refresh checks whether anything is in reach under this model's own settings: an in-scope memory (`tags`/`tags_match`, `tag_groups` and `fact_types` all narrow it) inside the window it would read — the whole bank in `full` mode, everything since `last_memory_seen_at` in `delta` mode — or a sibling mental model, unless `exclude_mental_models` closed that door. When there is nothing, the refresh completes immediately, leaves the document untouched, and spends nothing. This is the common case on a bank that was just created: its pages are refreshed the moment they exist, before anything has been retained.
+- **No LLM call at all, if there is nothing to read.** Before the agentic loop starts, a refresh checks whether anything is in reach under this model's own settings: an in-scope memory (`tags`/`tags_match`, `tag_groups` and `fact_types` all narrow it) inside the window it would read — the whole bank in `full` mode, everything since `last_memory_seen_at` in `delta` mode — or a sibling mental model this refresh could read (same tags, not in `exclude_mental_model_ids`), unless `exclude_mental_models` closed that door. Sibling models alone only count for a document that has nothing to lose — an empty one, or one no refresh has ever written with memories in scope: a document built from memories is never rewritten from sibling models once its own memory scope comes up empty. When there is nothing, the refresh completes immediately, leaves the document untouched, and spends nothing. This is the common case on a bank that was just created: its pages are refreshed the moment they exist, before anything has been retained.
 - **A failed retrieval is not an empty one.** If a retrieval step raises — the database, the embedder or the reranker is unavailable — the refresh **fails** instead of writing what the model came up with without it. Content, `structured_output` and the watermark are all left untouched, so the retry reads the same window again. This is the distinction that matters: "we looked and there is nothing on this topic" is an answer and gets written; "we could not look" is a failure and gets preserved. Without it, a broken retriever silently replaced a document built over months with a generic "I don't have information about that".
 
 ### Refresh Mode
@@ -418,6 +419,41 @@ result2, _, _ := client.MentalModelsAPI.CreateMentalModel(ctx, mmBankID).
 fmt.Printf("Operation ID: %s\n", result2.GetOperationId())
 ```
 
+### Scheduled Full Refresh
+
+A `delta` model keeps unchanged sections byte-for-byte, which is the point — but over months
+of small edits a document can drift from what a fresh write would say: wording shaped by
+increments, sections that are hard to retire. `full_refresh_cron` adds a second, independent
+schedule on which the model is refreshed in **full** mode, while every other refresh stays
+`delta`:
+
+```json
+{
+  "trigger": {
+    "mode": "delta",
+    "refresh_after_consolidation": true,
+    "min_refresh_interval_seconds": 21600,
+    "full_refresh_cron": "0 3 * * 0"
+  }
+}
+```
+
+This model is edited in place after each consolidation (at most every 6 hours), and rewritten
+from scratch every Sunday at 03:00 UTC. Afterwards it carries on in `delta` mode — the
+schedule never changes `mode`.
+
+- **Independent of the other triggers.** It combines with `refresh_after_consolidation` or
+  with `refresh_cron`. If both crons are due on the same check, one refresh runs, in full mode.
+- **Its own clock.** It comes due against `last_full_refreshed_at`, not `last_refreshed_at`,
+  so frequent delta refreshes never push it back.
+- **Skipped when there is nothing to fix.** If no refresh ran since the last full one, the
+  tick is skipped. Unlike `refresh_cron` it is not gated on new memories: drift left by past
+  edits is still there on a quiet bank.
+- **Same safety as any automatic refresh.** It honours `min_refresh_interval_seconds`, pauses
+  while the last refresh failed, and a full refresh that fails keeps the current content.
+
+To run one full refresh now, send `{"mode": "full"}` to the [refresh endpoint](#refresh-a-mental-model).
+
 ### When to Use Automatic Refresh
 
 | Use Case | Automatic Refresh | Why |
@@ -475,6 +511,8 @@ for _, mm := range mentalModels.GetItems() {
 	fmt.Printf("- %s: %s\n", mm.GetName(), mm.GetSourceQuery())
 }
 ```
+
+A [knowledge page](./knowledge-pages.md) keeps its content in a mental model, so the list includes the models behind pages too. Each item carries `is_knowledge_page` to tell them apart, and `exclude_knowledge_pages=true` lists standalone mental models only (both the items and `total`).
 
 ---
 
@@ -612,6 +650,7 @@ The List endpoint previously defaulted to `full`. A caller that omits `detail` a
 | `tags` | list | metadata | Tags for filtering |
 | `last_refreshed_at` | string | metadata | When a refresh last finished — wall-clock. Advances on every completed refresh, including one that found nothing new. Answers "have I already refreshed this?" |
 | `last_memory_seen_at` | string | metadata | The newest in-scope memory the last refresh saw. Answers "is this behind the data?" — compare against `last_memory_write_at` from the stats endpoint |
+| `last_full_refreshed_at` | string \| null | metadata | When a refresh last ran in full mode — asked for, scheduled, or a delta that fell back to full. `full_refresh_cron` comes due against this |
 | `created_at` | string | metadata | When the mental model was created |
 | `source_query` | string | content | The query used to generate content |
 | `content` | string | content | The generated mental model text |
@@ -667,12 +706,60 @@ Refreshing is useful when:
 - Observations have been updated
 - You want to ensure the mental model reflects current knowledge
 
+**Full refresh on demand.** Send `{"mode": "full"}` as the body to rewrite the content from
+scratch this once, whatever the model's `mode`. The model keeps its mode — a `delta` model
+goes back to editing in place on its next refresh. Use it to clear the drift a `delta` model
+builds up over many edits; to do it on a schedule, set
+[`full_refresh_cron`](#scheduled-full-refresh).
+
+### Python
+
+```python
+# Rewrite the content from scratch this once; the model keeps its mode
+result = client.refresh_mental_model(
+    bank_id=BANK_ID,
+    mental_model_id=mental_model_id,
+    mode="full",
+)
+
+print(f"Full refresh operation ID: {result.operation_id}")
+```
+
+### Node.js
+
+```javascript
+// Rewrite the content from scratch this once; the model keeps its mode
+const fullResult = await client.refreshMentalModel(BANK_ID, mentalModelId, { mode: "full" });
+
+console.log(`Full refresh operation ID: ${fullResult.operation_id}`);
+```
+
+### CLI
+
+```bash
+# Rewrite the content from scratch this once; the model keeps its mode
+hindsight mental-model refresh "$BANK_ID" "$MENTAL_MODEL_ID" --full
+```
+
+### Go
+
+```go
+// Rewrite the content from scratch this once; the model keeps its mode
+fullReq := hindsight.NewRefreshMentalModelRequest()
+fullReq.SetMode("full")
+fullResult, _, _ := client.MentalModelsAPI.RefreshMentalModel(ctx, mmBankID, mentalModelID).
+	RefreshMentalModelRequest(*fullReq).Execute()
+
+fmt.Printf("Full refresh operation ID: %s\n", fullResult.GetOperationId())
+```
+
 **Refreshes coalesce.** A model has at most one refresh waiting at a time: if one is
 already queued and has not started yet, this call returns *that* operation instead of
 queueing an identical second one — the queued refresh reads the model as it stands when
 it runs, so it already covers what you just asked for. Poll the returned `operation_id`
 as usual. A refresh that is already *running* is not reused: it may have read the model
-before your latest change, so a new operation is queued behind it.
+before your latest change, so a new operation is queued behind it. A full refresh that joins
+a queued plain one turns that one into a full refresh.
 
 **And they run one at a time.** A model's refreshes never overlap: the operation queued
 behind a running one starts when that one finishes, so the model is written by one refresh
@@ -766,7 +853,7 @@ and takes the same time. It is validated and billed like a refresh.
 ### Keep traces: record every refresh as it happens
 
 A dry run only explains a refresh you run yourself. Refreshes driven by
-`refresh_after_consolidation` or `refresh_cron` happen with nobody watching, and by
+`refresh_after_consolidation`, `refresh_cron` or `full_refresh_cron` happen with nobody watching, and by
 the time you notice a bad document, the run that produced it is gone.
 
 Setting `trigger.keep_trace` records the same reasoning on every refresh of that
@@ -922,7 +1009,9 @@ The clear operation is synchronous and resets the content to an empty string. Th
 
 > **💡 Tip**
 >
-For long-lived delta-mode mental models, consider scheduling a periodic clear + refresh (e.g. every 48 hours) to keep the content accurate while still benefiting from incremental delta updates in between.
+To clear a delta model's drift, prefer a [full refresh](#refresh-a-mental-model) (`{"mode": "full"}`), or set
+[`full_refresh_cron`](#scheduled-full-refresh) to do it on a schedule. Unlike clearing first,
+a full refresh that fails leaves the current content in place.
 ---
 
 ## Update a Mental Model

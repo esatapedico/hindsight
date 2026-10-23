@@ -25,6 +25,12 @@ from hindsight_api.extensions.bank_tables import BankScopedTable
 from hindsight_api.extensions.base import Extension
 from hindsight_api.extensions.context import DefaultExtensionContext, ExtensionContext
 from hindsight_api.extensions.http import HttpExtension
+from hindsight_api.extensions.llm_request import (
+    LLMRequestExtension,
+    LLMRequestOverrides,
+    LLMRequestRefused,
+    LLMRequestTarget,
+)
 from hindsight_api.extensions.loader import load_extension
 from hindsight_api.extensions.mcp import MCPExtension
 from hindsight_api.extensions.memory_defense import (
@@ -36,6 +42,7 @@ from hindsight_api.extensions.memory_defense import (
     apply_redaction,
     parse_policy,
 )
+from hindsight_api.extensions.model_call import ModelCall, ModelCallExtension
 from hindsight_api.extensions.operation_validator import (
     # Bank Management operations
     BankListContext,
@@ -51,6 +58,9 @@ from hindsight_api.extensions.operation_validator import (
     CreateBankContext,
     # File Conversion
     FileConvertResult,
+    # Transfer imports
+    ImportArchiveDocument,
+    ImportContext,
     # Memory curation
     MemoryCurationAction,
     MemoryUpdateContext,
@@ -72,6 +82,7 @@ from hindsight_api.extensions.operation_validator import (
     RetainAttachmentInfo,
     RetainContext,
     RetainResult,
+    RetainSource,
     TagScopeContext,
     ValidationResult,
 )
@@ -96,6 +107,14 @@ __all__ = [
     "HttpExtension",
     # MCP Extension
     "MCPExtension",
+    # LLM Request Extension
+    "LLMRequestExtension",
+    "LLMRequestOverrides",
+    "LLMRequestRefused",
+    "LLMRequestTarget",
+    # Model Call Extension
+    "ModelCall",
+    "ModelCallExtension",
     # Operation Validator - Core
     "DeferOperation",
     "OperationValidationError",
@@ -109,6 +128,9 @@ __all__ = [
     "RetainAttachmentInfo",
     "RetainContext",
     "RetainResult",
+    "RetainSource",
+    "ImportArchiveDocument",
+    "ImportContext",
     "ValidationResult",
     # Operation Validator - Bank Management
     "BankListContext",

@@ -21,6 +21,7 @@ storage instead of the seam.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -29,13 +30,18 @@ from unittest.mock import patch
 import pytest
 
 from hindsight_api.engine.chunk_ids import build_chunk_id
+from hindsight_api.engine.db import DatabaseBackend
+from hindsight_api.extensions import OperationValidationError
 from hindsight_api.engine.memories import create_memories, get_memories, set_memories
 from hindsight_api.engine.memories.base import (
     DOC_META_FILE_STORAGE_KEY,
+    DOC_META_RETAIN_PARAMS,
+    META_OBSERVATION_SCOPES,
     EntityPrunePassResult,
     MemoriesExtension,
     RecallArms,
     RelinkPassResult,
+    RetagResult,
     RetainResult,
     RetainSession,
     ScanPage,
@@ -123,6 +129,13 @@ class InMemoryMemories(MemoriesExtension):
         doc = self.documents.get(str(document_id))
         if doc is not None:
             doc["tags"] = list(tags)
+
+    async def set_document_observation_scopes(self, *, bank_id, document_id, observation_scopes):
+        doc = self.documents.get(str(document_id))
+        if doc is not None:
+            params = json.loads(doc["metadata"].get(DOC_META_RETAIN_PARAMS) or "{}")
+            params["observation_scopes"] = observation_scopes
+            doc["metadata"][DOC_META_RETAIN_PARAMS] = json.dumps(params)
 
     async def set_document_file(self, *, bank_id, document_id, storage_key, original_name, content_type):
         self.calls.append("set_document_file")
@@ -843,8 +856,8 @@ class InMemoryMemories(MemoriesExtension):
 
     # -- transfer (#4969): the archive and document provenance an export/import carries ----------
 
-    async def dump_archived_memories(self, *, conn, fq_table, bank_id):
-        return [
+    async def iter_archived_memories(self, *, backend, fq_table, bank_id, page_size):
+        yield [
             {
                 "text": row.text,
                 "fact_type": row.fact_type,
@@ -1428,6 +1441,40 @@ def _stored(unit_id, text, fact_type, **kw):
     return StoredMemory(unit_id=unit_id, text=text, fact_type=fact_type, created_at=datetime.now(timezone.utc), **kw)
 
 
+class _CapsItsPages(InMemoryMemories):
+    """A store that serves at most 1,000 rows a page, whatever ``limit`` asks for, and records
+    every ``limit`` it was asked — the shape of a store with a page cap."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.asked: list[int] = []
+
+    async def scan_memories(self, *, conn, fq_table, bank_id, limit=100, page_token="", **kwargs):
+        self.asked.append(limit)
+        return await super().scan_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, limit=min(limit, 1000), page_token=page_token, **kwargs
+        )
+
+
+async def test_whole_set_reads_page_to_the_end_without_an_oversized_page():
+    """A default that needs every matching memory pages to the end: one call with a huge limit
+    stops at the store's page cap, and a store that sizes its admission by the limit reserves
+    memory for rows it will never return."""
+    store = _CapsItsPages()
+    for i in range(2500):
+        uid = str(uuid.UUID(int=i + 1))
+        store.rows[uid] = _stored(uid, f"fact {i}", "world")
+
+    scope = await store.bank_memories_of_type(conn=None, fq_table=None, bank_id="b", fact_type="world")
+    assert sorted(scope.unit_ids) == sorted(store.rows)
+    assert store.asked and max(store.asked) <= 1000
+
+    store.asked.clear()
+    requeued = await store.clear_observations_and_requeue(conn=None, fq_table=None, bank_id="b")
+    assert requeued == 0
+    assert len(store.asked) == 3 and max(store.asked) <= 1000
+
+
 async def test_store_document_bodies_carries_retain_params(restore_default_store):
     """A store that owns the whole retain has NO SQL `documents` row, so anything the write path
     does not put in the store record is lost outright.
@@ -1875,6 +1922,62 @@ async def test_ensuring_a_bank_ensures_its_storage(memory, request_context, rest
 
     assert "ensure_bank_storage" in store.calls
     assert "lifecycle-bank" in store.ensured
+
+
+class _ProbesTheRow(InMemoryMemories):
+    """Records, on each ensure, whether the bank row was already visible to other requests."""
+
+    def __init__(self, backend: DatabaseBackend):
+        super().__init__({})
+        self._backend = backend
+        self.row_was_there: list[bool] = []
+
+    async def ensure_bank_storage(self, bank_id: str) -> None:
+        from hindsight_api.engine.retain import bank_utils
+
+        self.row_was_there.append(await bank_utils.bank_exists(self._backend, bank_id))
+        await super().ensure_bank_storage(bank_id)
+
+
+async def test_storage_is_ensured_before_the_bank_row_is_visible(memory, request_context, restore_default_store):
+    """The row is what makes a bank readable to every other request, so the storage goes first.
+
+    A store that owns its storage faults a read against a bank whose storage is not there yet —
+    correctly, since it cannot tell that from storage that has gone missing. With the row written
+    first, every request arriving in the gap gets that fault on a bank that was only just asked
+    for, and the gap is not nominal: the create is a round trip to an external service. A client
+    that creates a bank and immediately reads it is the normal case, not a race to be tolerated.
+    """
+    store = _ProbesTheRow(await memory._get_backend())
+    set_memories(store)
+
+    await memory._ensure_bank_exists("storage-first-bank", request_context)
+
+    assert store.row_was_there == [False], "the bank row must not be visible before its storage exists"
+
+
+async def test_importing_a_bank_ensures_its_storage_before_the_row(memory, request_context, restore_default_store):
+    """Import writes the bank row itself, bypassing the create path, so it needs the same order."""
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.transfer import export_bank
+
+    bank_id = f"storage-first-import-{uuid.uuid4().hex[:8]}"
+    backend = await memory._get_backend()
+    # Exported and deleted under the default store, so only the restore runs against the probe.
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    async with acquire_with_retry(backend) as conn:
+        archive = await export_bank(conn, bank_id)
+    await memory.delete_bank(bank_id, request_context=request_context)
+
+    store = _ProbesTheRow(backend)
+    set_memories(store)
+    try:
+        await memory.import_bank_async(archive, request_context)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    # Later ensures of the now-existing bank see the row; only the first one, the import's, must not.
+    assert store.row_was_there[:1] == [False], "the restored bank row must not be visible before its storage"
 
 
 async def test_ensuring_an_existing_bank_still_ensures_its_storage(memory, request_context, restore_default_store):
@@ -2523,13 +2626,13 @@ async def test_a_resumed_streaming_retain_reports_a_store_owned_documents_unit_i
 
 
 # ---------------------------------------------------------------------------
-# Retag requeue gate (#4969). The base `retag_document_memories` cleared the consolidation
-# marker on every retag, even one that invalidated nothing — so the document's memories were
-# re-consolidated for no reason, and the marker saying they already had been was lost.
+# Retag requeue gate. A memory is requeued exactly when the retag moves the observation scopes
+# it resolves to (#5593) — whether or not it had an observation there, since it was never
+# consolidated in its new scope (#5309). One whose scopes stay put keeps its marker (#4969).
 # ---------------------------------------------------------------------------
 
 
-async def _retag(store: InMemoryMemories) -> int:
+async def _retag(store: InMemoryMemories) -> RetagResult:
     return await store.retag_document_memories(
         conn=None,
         ops=None,
@@ -2548,14 +2651,46 @@ def _consolidated_fact(when: datetime) -> StoredMemory:
     )
 
 
-async def test_a_retag_that_deletes_no_observation_keeps_the_consolidation_marker():
+async def test_a_retag_that_moves_a_memory_requeues_it_without_an_observation():
+    store = InMemoryMemories({})
+    store.rows["fact-1"] = _consolidated_fact(datetime.now(timezone.utc))
+
+    result = await _retag(store)
+    assert result == RetagResult(invalidated_observations=0, requeued_units=1)
+    assert store.rows["fact-1"].tags == ["new"]
+    assert store.rows["fact-1"].consolidated_at is None
+
+
+async def test_a_scope_only_change_keeps_tags_and_requeues_only_what_moved():
     when = datetime.now(timezone.utc)
     store = InMemoryMemories({})
     store.rows["fact-1"] = _consolidated_fact(when)
+    store.rows["fact-2"] = StoredMemory(
+        unit_id="fact-2",
+        text="another fact",
+        fact_type="world",
+        document_id="doc-1",
+        tags=["old"],
+        observation_scopes=[["old"]],
+        consolidated_at=when,
+    )
 
-    assert await _retag(store) == 0
-    assert store.rows["fact-1"].tags == ["new"]
+    result = await store.retag_document_memories(
+        conn=None,
+        ops=None,
+        fq_table=None,
+        bank_id="bank-x",
+        document_id="doc-1",
+        tags=None,
+        retagged=lambda old: list(old or []),
+        rescoped=lambda _scopes: '[["old"]]',
+    )
+
+    # fact-1 (combined over ["old"]) and fact-2 ([["old"]]) both resolve to {"old"}: no move.
+    assert result == RetagResult()
+    assert store.rows["fact-1"].tags == ["old"]
     assert store.rows["fact-1"].consolidated_at == when
+    assert store.rows["fact-2"].consolidated_at == when
 
 
 async def test_a_retag_that_deletes_an_observation_requeues_its_sources():
@@ -2565,9 +2700,88 @@ async def test_a_retag_that_deletes_an_observation_requeues_its_sources():
         unit_id="obs-1", text="an observation", fact_type="observation", source_memory_ids=["fact-1"]
     )
 
-    assert await _retag(store) == 1
+    assert await _retag(store) == RetagResult(invalidated_observations=1, requeued_units=1)
     assert "obs-1" not in store.rows
     assert store.rows["fact-1"].consolidated_at is None
+
+
+# Scope-aware invalidation (#5593): under `shared` the tags are not the scope, so a retag or a
+# re-retain relabel moves no observation and must requeue nothing.
+
+
+async def test_a_retag_under_shared_scopes_keeps_its_observations():
+    when = datetime.now(timezone.utc)
+    store = InMemoryMemories({})
+    store.rows["fact-1"] = _consolidated_fact(when)
+    store.rows["fact-1"].observation_scopes = "shared"
+    store.rows["obs-1"] = StoredMemory(
+        unit_id="obs-1", text="an observation", fact_type="observation", source_memory_ids=["fact-1"]
+    )
+
+    assert await _retag(store) == RetagResult()
+    assert "obs-1" in store.rows
+    assert store.rows["fact-1"].tags == ["new"]
+    assert store.rows["fact-1"].consolidated_at == when
+
+
+@pytest.mark.parametrize(
+    ("scopes", "moved"),
+    [("shared", False), ([["team"]], False), ("combined", True), (None, True), ("per_tag", True)],
+)
+async def test_relabel_reports_only_memories_whose_scopes_move(scopes, moved):
+    store = InMemoryMemories({})
+    store.rows["fact-1"] = StoredMemory(
+        unit_id="fact-1",
+        text="a fact",
+        fact_type="world",
+        document_id="doc-1",
+        tags=["team", "session:1"],
+        observation_scopes=scopes,
+    )
+
+    result = await store.relabel_document_memories(
+        conn=None,
+        fq_table=None,
+        bank_id="bank-x",
+        document_id="doc-1",
+        tags=["team", "session:2"],
+        metadata={},
+        observation_scopes=scopes,
+        final_tags=lambda _old: ["team", "session:2"],
+    )
+
+    assert result.rescoped_unit_ids == (["fact-1"] if moved else [])
+
+
+async def test_relabel_with_unchanged_labels_patches_nothing():
+    """#5614: a patch moves `updated_at`, which consolidation reads as "this fact was edited" — so
+    re-sending a document with the same tags, metadata and scopes must patch no memory, and a real
+    change must still patch it."""
+    store = InMemoryMemories({})
+    store.rows["fact-1"] = StoredMemory(
+        unit_id="fact-1",
+        text="a fact",
+        fact_type="world",
+        document_id="doc-1",
+        tags=["team"],
+        metadata={"src": "v1"},
+        observation_scopes="shared",
+    )
+
+    async def _relabel(metadata):
+        return await store.relabel_document_memories(
+            conn=None,
+            fq_table=None,
+            bank_id="bank-x",
+            document_id="doc-1",
+            tags=["team"],
+            metadata=metadata,
+            observation_scopes="shared",
+            final_tags=lambda _old: ["team"],
+        )
+
+    assert (await _relabel({"src": "v1"})).updated == 0
+    assert (await _relabel({"src": "v2"})).updated == 1
 
 
 async def test_the_engine_resolves_entities_in_sql_whatever_store_is_configured(
@@ -2606,3 +2820,53 @@ async def test_the_engine_resolves_entities_in_sql_whatever_store_is_configured(
             await _teardown_memory_engine(engine)
     finally:
         set_memories(real_store)
+
+
+async def _store_owned_document(memory, request_context, store: InMemoryMemories) -> None:
+    class _Fact:
+        fact_text = "the cat sat on the mat"
+        fact_type = "world"
+        tags = ["session:1"]
+
+    await store.put_document(
+        bank_id="seam-bank", document_id="d", content_hash="h", original_text="x", chunk_texts=["x"], tags=["session:1"]
+    )
+    await store.insert_facts(conn=None, ops=None, bank_id="seam-bank", facts=[_Fact()], document_id="d")
+    await memory.ensure_bank_profile("seam-bank", request_context=request_context)
+
+
+async def test_engine_scope_patch_writes_the_store_record_and_its_memories(
+    memory, request_context, restore_default_store
+):
+    """#5309 on a store-owned bank: the record's retain params carry the new scope (what reprocess
+    replays) and the memories are rescoped, all through the seam."""
+    store = InMemoryMemories({})
+    set_memories(store)
+    await _store_owned_document(memory, request_context, store)
+
+    assert await memory.update_document("d", "seam-bank", observation_scopes="shared", request_context=request_context)
+
+    params = json.loads(store.documents["d"]["metadata"][DOC_META_RETAIN_PARAMS])
+    assert params["observation_scopes"] == "shared"
+    # The change queues consolidation, which runs inline here and adds an observation row.
+    facts = [m for m in store.rows.values() if m.fact_type == "world"]
+    # The seam carries a memory's scopes in its metadata bag (META_OBSERVATION_SCOPES).
+    assert [(m.metadata or {}).get(META_OBSERVATION_SCOPES) for m in facts] == ['"shared"']
+    assert facts[0].tags == ["session:1"], "a scope-only change keeps the tags"
+
+
+async def test_engine_scope_patch_is_refused_by_a_store_without_support(memory, request_context, restore_default_store):
+    """A store that cannot rewrite the record's params answers 400 and nothing moves — rescoping
+    the memories alone would be undone by the next reprocess."""
+
+    class _NoScopeWrites(InMemoryMemories):
+        set_document_observation_scopes = MemoriesExtension.set_document_observation_scopes
+
+    store = _NoScopeWrites({})
+    set_memories(store)
+    await _store_owned_document(memory, request_context, store)
+
+    with pytest.raises(OperationValidationError) as e:
+        await memory.update_document("d", "seam-bank", observation_scopes="shared", request_context=request_context)
+    assert e.value.status_code == 400
+    assert [(m.metadata or {}).get(META_OBSERVATION_SCOPES) for m in store.rows.values()] == [None]

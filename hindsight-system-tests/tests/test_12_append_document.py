@@ -16,6 +16,7 @@ import asyncio
 import json
 
 import pytest
+from hindsight_client_api.exceptions import ApiException
 
 from hindsight_system_tests.payloads import consolidation, extracted, fact
 
@@ -262,3 +263,38 @@ async def test_concurrent_synchronous_appends_keep_every_turn(client, bank_id, s
     assert not missing, f"turns lost: {missing}"
     remembered = await _fact_texts(client, bank_id, document_id=DOCUMENT_ID)
     assert remembered and set(remembered) == {MENTION}, remembered
+
+
+async def test_conversation_turns_appended_together_to_a_new_document_stay_one_array(
+    client, bank_id, settled, mentions
+):
+    """Several conversation turns that reach a document in one execution — one request
+    carrying them, or queued turns the worker folds together — before the document
+    exists. They must be stored as ONE JSON array, like turns appended onto a stored
+    conversation are. They used to be joined with a newline instead: not JSON,
+    so turn-aware chunking and speaker attribution were lost for the session's opening."""
+    turns = [[{"role": "user", "content": turn}] for turn in TURNS[:2]]
+    await client.aretain_batch(
+        bank_id=bank_id,
+        items=[{"content": json.dumps(turn), "update_mode": "append"} for turn in turns],
+        document_id=DOCUMENT_ID,
+    )
+    await settled(bank_id)
+
+    document = await client.documents.get_document(bank_id, DOCUMENT_ID)
+    assert json.loads(document.original_text) == turns[0] + turns[1]
+
+
+@pytest.mark.parametrize("retain_async", [False, True])
+async def test_an_append_without_a_document_is_refused_up_front(client, bank_id, retain_async):
+    """An append names no document to append to, so it can never succeed. Both
+    paths refuse it with 400. The queued path used to accept it, queue it, and let
+    the worker fail it after minutes of retries (#5415)."""
+    await client.acreate_bank(bank_id=bank_id, name="Alice")
+    with pytest.raises(ApiException) as exc:
+        await client.aretain(bank_id=bank_id, content=FIRST, update_mode="append", retain_async=retain_async)
+    assert exc.value.status == 400
+    assert "requires a document_id" in exc.value.body
+
+    operations = await client.operations.list_operations(bank_id)
+    assert operations.total == 0

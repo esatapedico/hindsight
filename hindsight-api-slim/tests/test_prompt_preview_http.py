@@ -133,12 +133,15 @@ async def test_consolidation_mission_slot_shows_the_default_when_unset(api_clien
 
 
 @pytest.mark.asyncio
-async def test_reflect_mission_lands_in_the_system_prompt(api_client, bank_id, memory):
-    """Reflect is the one operation whose mission IS the system prompt's role line."""
+async def test_reflect_mission_lands_in_the_system_prompt_and_after_the_question(api_client, bank_id, memory):
+    """Reflect is the one operation whose mission IS the system prompt's role line; it is
+    restated on the user message too, after the question, and the preview shows both."""
     mission = "You are a pricing analyst for the sales team."
     await _configure(memory, bank_id, reflect_mission=mission)
+    body = await _preview(api_client, bank_id, "reflect")
 
-    assert mission in _text(_message(await _preview(api_client, bank_id, "reflect"), "system"))
+    assert mission in _text(_message(body, "system"))
+    assert _block(_message(body, "user"), "reflect_mission")["text"] == mission
 
 
 @pytest.mark.asyncio
@@ -486,6 +489,17 @@ async def test_preview_never_exposes_credentials(api_client, bank_id, memory):
     for message in body["messages"]:
         for block in message["blocks"]:
             assert block["field"] not in credentials
+
+
+def test_the_reflect_preview_asks_for_answer_ready_without_a_decision_model():
+    """The preview shows the prompt the engine sends: agent turns say "enough" with answer_ready (#5832)."""
+    config = HindsightConfig.from_env()
+    assert config.decision_model_config("reflect") is None, "this test needs no reflect decision model set up"
+
+    preview = render_prompt_preview("reflect", config, {"name": "b"})
+
+    system = next(m for m in preview.messages if m.role == "system")
+    assert "answer_ready" in system.text
 
 
 def test_the_response_carries_no_display_copy():

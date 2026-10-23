@@ -97,6 +97,35 @@ def set_default_graph_retriever(retriever: GraphRetriever | None) -> None:
     _default_graph_retriever = retriever
 
 
+async def resolve_temporal_constraint(
+    query_text: str,
+    *,
+    temporal_window: "TemporalWindow | None",
+    enable_temporal_retrieval: bool,
+    question_date: datetime | None,
+    query_analyzer: Optional["QueryAnalyzer"],
+) -> tuple[datetime, datetime] | None:
+    """The window recall's temporal arm searches, or None when it has nothing to search on.
+
+    One function for both recall paths — the pipeline below and a store that answers the whole
+    recall itself — so the bank's ``enable_temporal_retrieval`` and the dates in the query mean
+    the same thing whichever one answers.
+    """
+    if not enable_temporal_retrieval:
+        return None
+    if temporal_window is not None:
+        # The caller already knows the range it means, so there is nothing to
+        # infer. Skipping the analysis is also the point: it is pure CPU
+        # serialised through a single worker, and costs up to ~1.3s on
+        # document-sized query text (see temporal_extraction).
+        return (temporal_window.start, temporal_window.end)
+    from .temporal_extraction import extract_temporal_constraint_async
+
+    # Off the event loop: this is pure CPU and would otherwise stall every
+    # other in-flight request in the process, not just this recall.
+    return await extract_temporal_constraint_async(query_text, reference_date=question_date, analyzer=query_analyzer)
+
+
 async def retrieve_all_fact_types_parallel(
     pool,
     query_text: str,
@@ -117,6 +146,7 @@ async def retrieve_all_fact_types_parallel(
     enable_text_search: bool = True,
     enable_temporal_retrieval: bool = True,
     enable_graph_retrieval: bool = True,
+    temporal_resolved: bool = False,
 ) -> MultiFactTypeRetrievalResult:
     """
     Retrieve every recall arm for all fact types, through the memories store.
@@ -146,6 +176,9 @@ async def retrieve_all_fact_types_parallel(
             query analysis that feeds it (no constraint means nothing to filter on).
         enable_graph_retrieval: Run the entity/link graph arm. False skips those queries
             and returns no graph results.
+        temporal_resolved: The caller already ran :func:`resolve_temporal_constraint`, and
+            ``temporal_window`` is its answer — None meaning no window, not "extract one".
+            Saves a second extraction when the engine resolved the window for a store first.
 
     Returns:
         MultiFactTypeRetrievalResult with results organized by fact type
@@ -153,29 +186,23 @@ async def retrieve_all_fact_types_parallel(
     import time
 
     config = get_config()
-    start_time = time.time()
+    start_time = time.perf_counter()
     timings: dict[str, float] = {}
 
     # Step 1: Extract temporal constraint first (CPU work, no DB)
     # Do this before the store call so we know whether the temporal arm is needed at all.
-    temporal_extraction_start = time.time()
-    temporal_constraint = None
-    if enable_temporal_retrieval:
-        if temporal_window is not None:
-            # The caller already knows the range it means, so there is nothing to
-            # infer. Skipping the analysis is also the point: it is pure CPU
-            # serialised through a single worker, and costs up to ~1.3s on
-            # document-sized query text (see temporal_extraction).
-            temporal_constraint = (temporal_window.start, temporal_window.end)
-        else:
-            from .temporal_extraction import extract_temporal_constraint_async
-
-            # Off the event loop: this is pure CPU and would otherwise stall every
-            # other in-flight request in the process, not just this recall.
-            temporal_constraint = await extract_temporal_constraint_async(
-                query_text, reference_date=question_date, analyzer=query_analyzer
-            )
-    temporal_extraction_time = time.time() - temporal_extraction_start
+    temporal_extraction_start = time.perf_counter()
+    if temporal_resolved:
+        temporal_constraint = (temporal_window.start, temporal_window.end) if temporal_window is not None else None
+    else:
+        temporal_constraint = await resolve_temporal_constraint(
+            query_text,
+            temporal_window=temporal_window,
+            enable_temporal_retrieval=enable_temporal_retrieval,
+            question_date=question_date,
+            query_analyzer=query_analyzer,
+        )
+    temporal_extraction_time = time.perf_counter() - temporal_extraction_start
     timings["temporal_extraction"] = temporal_extraction_time
 
     # Step 2: Run every arm for every fact type through the store's single recall method.
@@ -187,7 +214,7 @@ async def retrieve_all_fact_types_parallel(
     # query) or the host adding overhead around it. The nine per-arm rows below cannot answer that
     # either -- a store-owned recall returns every arm from a single call, so their durations are
     # literals.
-    _unified_start = time.time()
+    _unified_start = time.perf_counter()
     unified = await get_memories().recall_unified(
         conn=pool,
         bank_id=bank_id,
@@ -208,7 +235,7 @@ async def retrieve_all_fact_types_parallel(
         enable_graph=enable_graph_retrieval,
     )
 
-    _unified_elapsed = time.time() - _unified_start
+    _unified_elapsed = time.perf_counter() - _unified_start
 
     results_by_fact_type: dict[str, ParallelRetrievalResult] = {}
     for ft in fact_types:
@@ -237,7 +264,7 @@ async def retrieve_all_fact_types_parallel(
             max_conn_wait=0.0,
         )
 
-    timings["total"] = time.time() - start_time
+    timings["total"] = time.perf_counter() - start_time
     return MultiFactTypeRetrievalResult(
         results_by_fact_type=results_by_fact_type,
         timings=timings,
