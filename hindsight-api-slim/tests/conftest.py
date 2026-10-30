@@ -329,6 +329,30 @@ def pg0_db_url(db_url, tmp_path_factory, worker_id):
     return url
 
 
+@pytest.fixture(scope="module")
+def fresh_db_url(pg0_db_url):
+    """An empty database of the module's own, on the shared test server.
+
+    For tests that walk migration history (upgrade, downgrade, seed in between):
+    they need a schema nobody else touches, but not a server of their own.
+    Starting a server per module raced xdist workers onto the same port (#5956).
+    """
+    import uuid
+
+    from sqlalchemy import create_engine, make_url, text
+
+    name = f"hs_test_{uuid.uuid4().hex[:12]}"
+    admin = create_engine(pg0_db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            conn.execute(text(f'CREATE DATABASE "{name}"'))
+        yield make_url(pg0_db_url).set(database=name).render_as_string(hide_password=False)
+        with admin.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+    finally:
+        admin.dispose()
+
+
 def _cleanup_stale_test_data(db_url: str) -> None:
     """Drop all per-bank vector indexes and test data from previous sessions.
 
@@ -782,7 +806,7 @@ def stub_refresh_has_sources(monkeypatch, memory) -> None:
     async def _has_document(*args, **kwargs) -> bool:
         return True
 
-    monkeypatch.setattr(memory, "_bank_has_readable_document", _has_document)
+    monkeypatch.setattr(memory, "_siblings_are_a_source", _has_document)
 
 
 def enable_audit_default(memory, enabled: bool) -> None:

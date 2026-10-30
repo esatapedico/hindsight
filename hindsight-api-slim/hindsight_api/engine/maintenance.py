@@ -17,7 +17,8 @@ from one place, so we don't spawn a separate ``asyncio`` task per concern:
   when the model is stale (new memories in its scope since its last refresh), so
   a scheduled tick never burns an LLM call to regenerate identical content. The
   per-model schedule lives in the cron expression; this loop only decides when to
-  *check*.
+  *check*. The same scan runs ``trigger.full_refresh_cron``, the independent
+  schedule on which a (typically delta) model gets a full-mode refresh (#4340).
 
 The loop wakes on a short fixed tick and runs each job when its own
 ``last_run + interval`` is due (run-at-start, then on interval), so adding jobs
@@ -65,6 +66,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import ConfigLike, get_config
 from ..models import RequestContext
+from ..schema_context import _current_schema
 from .db_utils import acquire_with_retry
 from .schema import _is_oracle, fq_routine, fq_table, fq_table_explicit
 
@@ -76,6 +78,12 @@ logger = logging.getLogger(__name__)
 
 # Short tick so jobs with different cadences share one loop without per-job tasks.
 _TICK_SECONDS = 60
+# How long stop() lets the job in progress reach a stopping point before cancelling it.
+_STOP_GRACE_SECONDS = 5.0
+# How long stop() then waits for the cancel to land. A job that suppresses or delays
+# cancellation (a call that does not yield, a cleanup that catches CancelledError) is
+# left behind after this rather than waited on.
+_STOP_CANCEL_GRACE_SECONDS = 5.0
 # ── retention sweep pacing ────────────────────────────────────────────────────
 # Retention used to issue one unbounded `DELETE FROM <table> WHERE started_at <
 # cutoff` per schema. On a table with a real backlog that is a single statement
@@ -101,6 +109,14 @@ _RETENTION_MAX_BATCHES = 1000
 # pods sweeping at once multiply that, which is still orders of magnitude gentler
 # than the unbounded delete this replaces.
 _RETENTION_BATCH_PAUSE_SECONDS = 0.25
+
+
+@dataclass(frozen=True)
+class _DueScheduledRefresh:
+    """A discovery row whose schedule has fired; ``full`` when it is the full refresh's."""
+
+    row: Any
+    full: bool
 
 
 @dataclass(frozen=True)
@@ -146,14 +162,35 @@ class MaintenanceLoop:
             logger.debug("Cannot start maintenance loop: no running event loop")
 
     async def stop(self) -> None:
-        """Stop the loop and wait for the current tick to finish."""
+        """Stop the loop: let the current job reach its next stopping point, then cancel it.
+
+        A job can run for a long time (a scheduled-refresh pass over many models, a
+        reconcile over many banks), and shutdown waits on this. Every job is safe to
+        cut short: each unit of work is its own transaction, and whatever was not
+        reached is still due on the next tick of the next process.
+        """
         self._stop.set()
-        if self._task and not self._task.done():
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        task = self._task
         self._task = None
+        if task is None or task.done():
+            return
+        _, pending = await asyncio.wait({task}, timeout=_STOP_GRACE_SECONDS)
+        if pending:
+            logger.info(f"Maintenance: cancelling the job in progress after {_STOP_GRACE_SECONDS:.0f}s to stop")
+            task.cancel()
+            _, pending = await asyncio.wait({task}, timeout=_STOP_CANCEL_GRACE_SECONDS)
+            if pending:
+                logger.warning(
+                    f"Maintenance: the job in progress did not stop within {_STOP_CANCEL_GRACE_SECONDS:.0f}s "
+                    "of being cancelled; leaving it behind"
+                )
+                return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Maintenance tick failed while stopping")
 
     @staticmethod
     def _any_job_enabled() -> bool:
@@ -377,8 +414,6 @@ class MaintenanceLoop:
             return
         known = {t.schema for t in tenants} | {get_config().database_schema}
 
-        from .memory_engine import _current_schema
-
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.operation_retention_days)
         pruned = 0
         for row in rows:
@@ -455,11 +490,11 @@ class MaintenanceLoop:
         if not targets:
             return
 
-        from .memory_engine import _current_schema
-
         submitted = 0
         skipped_unknown = 0
         for target in targets:
+            if self._stop.is_set():
+                break
             schema = target.schema_name
             bank_id = target.bank_id
             tenant = tenant_by_schema.get(schema)
@@ -496,8 +531,6 @@ class MaintenanceLoop:
         The schema is set for each, as a request would set it: a store derives where a bank's
         memories live from it.
         """
-        from .memory_engine import _current_schema
-
         engine = self._engine
         found: list[_ReconcileTarget] = []
         for schema in sorted(schemas):
@@ -527,7 +560,7 @@ class MaintenanceLoop:
     # ── scheduled mental model refresh ───────────────────────────────────────
 
     async def _run_scheduled_mm_refresh(self) -> None:
-        """Refresh mental models whose ``trigger.refresh_cron`` is due.
+        """Refresh mental models whose ``trigger.refresh_cron`` or ``full_refresh_cron`` is due.
 
         Discovery (the set of cron-scheduled models, minus any with an in-flight
         refresh) is one cross-tenant round-trip via
@@ -537,14 +570,23 @@ class MaintenanceLoop:
         isn't expressible in plain SQL. Each due model is refreshed only when it is
         actually stale, so a schedule that fires while nothing changed costs a
         cheap staleness query, not an LLM call.
+
+        ``full_refresh_cron`` is the same check against its own clock,
+        ``last_full_refreshed_at`` (``last_refreshed_at`` moves on every delta, so a
+        weekly full refresh keyed off it would never come due on a model that deltas
+        daily). Its gate is different on purpose: not "stale" but "a refresh ran
+        since the last full one" — a full refresh exists to clear the drift past
+        delta edits left, which a quiet bank still carries. When both schedules are
+        due the full refresh is the one submitted; it covers the other.
         """
         engine = self._engine
         try:
             async with acquire_with_retry(engine._backend, max_retries=1) as conn:
-                rows = await conn.fetch(
-                    "SELECT schema_name, bank_id, mental_model_id, refresh_cron, last_refreshed_at "
-                    f"FROM {fq_routine('mental_models_with_cron')}()"
-                )
+                # SELECT *, and the full-refresh columns read with .get() below: a
+                # deployment that owns this routine (alembic/_owned.py) may still return
+                # the shape before d4f7a2c9e1b5, and its refresh_cron schedules must keep
+                # working — it just gets no full_refresh_cron until it adds the columns.
+                rows = await conn.fetch(f"SELECT * FROM {fq_routine('mental_models_with_cron')}()")
         except Exception as e:
             logger.warning(f"Scheduled mental model refresh discovery failed: {e}")
             return
@@ -554,10 +596,10 @@ class MaintenanceLoop:
         from croniter import croniter
 
         now = datetime.now(timezone.utc)
-        due = []
-        for row in rows:
-            cron = row["refresh_cron"]
-            last = row["last_refreshed_at"]
+
+        def fired_since(cron: str | None, last: datetime | None, row: Any) -> bool:
+            if not cron:
+                return False
             try:
                 prev_fire = croniter(cron, now).get_prev(datetime)
             except (ValueError, KeyError) as e:
@@ -565,9 +607,17 @@ class MaintenanceLoop:
                     f"Scheduled mental model refresh: skipping invalid cron {cron!r} for "
                     f"{row['schema_name']}/{row['mental_model_id']}: {e}"
                 )
-                continue
-            if last is None or prev_fire > last:
-                due.append(row)
+                return False
+            return last is None or prev_fire > last
+
+        due: list[_DueScheduledRefresh] = []
+        for row in rows:
+            last_full = row.get("last_full_refreshed_at")
+            full_due = fired_since(row.get("full_refresh_cron"), last_full, row) and (
+                last_full is None or row["last_refreshed_at"] is None or row["last_refreshed_at"] > last_full
+            )
+            if full_due or fired_since(row["refresh_cron"], row["last_refreshed_at"], row):
+                due.append(_DueScheduledRefresh(row=row, full=full_due))
         if not due:
             return
 
@@ -582,14 +632,15 @@ class MaintenanceLoop:
         tenant_by_schema = {t.schema: t for t in tenants}
         default_schema = get_config().database_schema
 
-        from .memory_engine import _current_schema
-
         submitted = 0
         skipped_unknown = 0
         skipped_fresh = 0
         skipped_in_flight = 0
         skipped_paused = 0
-        for row in due:
+        for item in due:
+            if self._stop.is_set():
+                break
+            row = item.row
             schema = row["schema_name"]
             bank_id = row["bank_id"]
             mm_id = row["mental_model_id"]
@@ -605,21 +656,23 @@ class MaintenanceLoop:
                 # refresh — a scheduled refresh must not regenerate identical
                 # content. compute_mental_model_is_stale needs the model's tags +
                 # trigger, which the discovery routine doesn't return, so re-read
-                # the row under the bank's schema context.
-                async with acquire_with_retry(engine._backend, max_retries=1) as conn:
-                    mm_row = await conn.fetchrow(
-                        f"SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
-                        f"FROM {fq_table('mental_models')} "
-                        "WHERE bank_id = $1 AND id = $2",
-                        bank_id,
-                        mm_id,
-                    )
-                    if mm_row is None:
+                # the row under the bank's schema context. A full refresh skips this
+                # gate (its own was applied above — see the docstring).
+                if not item.full:
+                    async with acquire_with_retry(engine._backend, max_retries=1) as conn:
+                        mm_row = await conn.fetchrow(
+                            f"SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                            f"FROM {fq_table('mental_models')} "
+                            "WHERE bank_id = $1 AND id = $2",
+                            bank_id,
+                            mm_id,
+                        )
+                        if mm_row is None:
+                            continue
+                        is_stale = await engine.compute_mental_model_is_stale(conn, bank_id, mm_row)
+                    if not is_stale:
+                        skipped_fresh += 1
                         continue
-                    is_stale = await engine.compute_mental_model_is_stale(conn, bank_id, mm_row)
-                if not is_stale:
-                    skipped_fresh += 1
-                    continue
                 # skip_if_in_flight makes the enqueue itself idempotent. The discovery
                 # routine already excludes models with a pending/processing refresh,
                 # but that exclusion is a *read*: this loop runs in every process, so
@@ -632,6 +685,7 @@ class MaintenanceLoop:
                     request_context=context,
                     skip_if_in_flight=True,
                     automatic=True,
+                    mode="full" if item.full else None,
                 )
                 if result.get("paused"):
                     skipped_paused += 1

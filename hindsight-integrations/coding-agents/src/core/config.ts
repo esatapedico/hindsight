@@ -153,7 +153,7 @@ export interface RawConfig {
    *  `hindsight_search_knowledge_pages` results. It adds to the built-in text, never replaces it,
    *  so the plugin's call triggers and crediting rule keep up with releases (#4791). */
   toolGuideExtra?: string;
-  pageRefreshEveryTurns?: number; // knowledge-page refresh cadence in user turns (default 10)
+  pageRefreshEveryTurns?: number; // knowledge-page refresh cadence in user turns (default 1; 0 also means 1)
   /** What it COSTS to keep this project's knowledge pages current — the trigger stamped on every
    *  page this plugin creates (the seeded taxonomy and each captured initiative):
    *    "cron" (default)         — refresh on `pageTriggerCron` only, and only when actually stale
@@ -205,7 +205,7 @@ export interface RawConfig {
    *  File-only, and replaced (not merged) by a `banks.<id>` section, exactly like `pages`. */
   customPages?: CustomPagesConfig;
   autoSeed?: boolean; // SessionStart: auto-seed a cold repo's bank from git history (default true)
-  seedLimit?: number; // SessionStart auto-seed: most-recent-N-commits cap (default 300)
+  seedLimit?: number; // git-log document: keeps between seedLimit/2 and seedLimit newest commits (default 300)
   codebaseSurvey?: boolean; // SessionStart: spawn a headless claude to survey a cold repo's structure (default true)
   surveyModel?: string; // model passed to the headless survey's `claude -p --model` (default "haiku")
   surveyBudgetUsd?: number; // spend cap passed to the headless survey's `claude -p --max-budget-usd` (default 2)

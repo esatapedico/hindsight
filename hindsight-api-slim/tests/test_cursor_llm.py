@@ -3,7 +3,7 @@
 The CLI is replaced by a fake subprocess: what is under test is the seam between
 Hindsight and `cursor-agent` — how the prompt is assembled, how the child process is
 confined, how the emitted `type: "result"` line is found among the CLI's diagnostics,
-and how structured output and tool calls are parsed back out of free-form text.
+and how structured output is parsed back out of free-form text.
 """
 
 from __future__ import annotations
@@ -15,19 +15,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
 
 from hindsight_api.config import PROVIDER_DEFAULT_MODELS
-from hindsight_api.engine.llm_interface import (
-    LLM_TOOL_CHOICE_NONE,
-    LLM_TOOL_CHOICE_REQUIRED,
-    LLMToolChoice,
-    ProviderContentPolicyError,
-)
+from hindsight_api.engine.llm_interface import LLMToolChoice, ProviderContentPolicyError
 from hindsight_api.engine.llm_wrapper import create_llm_provider, requires_api_key
+from hindsight_api.engine.providers import tools_via_schema
 from hindsight_api.engine.providers.cursor_llm import CursorLLM
 
 _TOOLS = [
@@ -255,59 +251,20 @@ async def test_last_result_object_wins_over_earlier_lines():
 
 
 @pytest.mark.asyncio
-async def test_tool_calls_are_parsed_from_the_json_envelope():
-    envelope = json.dumps({"content": None, "tool_calls": [{"name": "recall", "arguments": {"query": "rome"}}]})
-    with _provider(_result_line(envelope)) as s:
-        result = await s.llm.call_with_tools(
+async def test_schema_format_reply_is_returned_as_the_dict():
+    """A tool turn's schema (``tools_via_schema.schema_format``) is asked for in the prompt and parsed back."""
+    held = tools_via_schema.response_schema(_TOOLS, LLMToolChoice.named("recall"))
+    with _provider(_result_line('{"query": "rome"}')) as s:
+        result = await s.llm.call(
             messages=[{"role": "user", "content": "what do I know about rome?"}],
-            tools=_TOOLS,
-            tool_choice=LLM_TOOL_CHOICE_REQUIRED,
+            response_format=tools_via_schema.schema_format(held),
+            strict_schema=True,
+            skip_validation=True,
             max_retries=0,
         )
 
-    assert result.finish_reason == "tool_calls"
-    assert [(c.name, c.arguments) for c in result.tool_calls] == [("recall", {"query": "rome"})]
-    assert result.input_tokens == 120
-    assert result.output_tokens == 7
-    assert "MUST call at least one tool" in s.prompt
-
-
-@pytest.mark.asyncio
-async def test_named_tool_choice_offers_only_that_tool():
-    with _provider(_result_line(json.dumps({"tool_calls": [{"name": "recall", "arguments": {}}]}))) as s:
-        await s.llm.call_with_tools(
-            messages=[{"role": "user", "content": "go"}],
-            tools=_TOOLS + [{"function": {"name": "other", "description": "", "parameters": {}}}],
-            tool_choice=LLMToolChoice.named("recall"),
-            max_retries=0,
-        )
-
-    assert "MUST call the 'recall' tool" in s.prompt
-    assert '"other"' not in s.prompt
-
-
-@pytest.mark.asyncio
-async def test_hallucinated_tool_name_is_dropped():
-    with _provider(_result_line(json.dumps({"tool_calls": [{"name": "delete_everything", "arguments": {}}]}))) as s:
-        result = await s.llm.call_with_tools(messages=[{"role": "user", "content": "go"}], tools=_TOOLS, max_retries=0)
-
-    assert result.tool_calls == []
-    assert result.finish_reason == "stop"
-
-
-@pytest.mark.asyncio
-async def test_tool_choice_none_asks_for_plain_text():
-    with _provider(_result_line("just text")) as s:
-        result = await s.llm.call_with_tools(
-            messages=[{"role": "user", "content": "go"}],
-            tools=_TOOLS,
-            tool_choice=LLM_TOOL_CHOICE_NONE,
-            max_retries=0,
-        )
-
-    assert result.content == "just text"
-    assert result.tool_calls == []
-    assert "Do not call any tools" in s.prompt
+    assert result.content == {"query": "rome"}
+    assert '"query"' in s.prompt and "valid JSON matching this schema" in s.prompt
 
 
 @pytest.mark.asyncio
@@ -361,3 +318,17 @@ def test_provider_is_registered():
     with patch("hindsight_api.engine.providers.cursor_llm.shutil.which", return_value="/usr/bin/cursor-agent"):
         llm = create_llm_provider(provider="cursor", api_key="", base_url="", model="auto", reasoning_effort=None)
     assert isinstance(llm, CursorLLM)
+
+
+@pytest.mark.asyncio
+async def test_successful_calls_record_a_trace_span(monkeypatch):
+    """The wrapper records only failed calls, so a successful one is the provider's to trace (#5381)."""
+    import hindsight_api.tracing as tracing
+
+    recorder = MagicMock()
+    monkeypatch.setattr(tracing, "get_span_recorder", lambda: recorder)
+
+    with _provider(_result_line("hello")) as s:
+        await s.llm.call(messages=[{"role": "user", "content": "x"}], max_retries=0)
+    assert recorder.record_llm_call.call_count == 1
+    assert recorder.record_llm_call.call_args.kwargs["response_content"] == "hello"

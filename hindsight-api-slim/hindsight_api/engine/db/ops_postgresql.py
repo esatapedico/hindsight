@@ -26,7 +26,7 @@ def pg_search_vector_expr(
     config,
     *,
     text_col: str = "text",
-    context_col: str = "context",
+    context_col: str | None = "context",
     signals_col: str | None = "text_signals",
     native_inline: bool = True,
 ) -> str | None:
@@ -41,8 +41,9 @@ def pg_search_vector_expr(
     nothing to build.
 
     The ``*_col`` arguments are the SQL for each text source (a column name or a
-    bind placeholder); pass ``signals_col=None`` for a two-column table like
-    ``mental_models`` (name + content). Pass ``native_inline=False`` when the
+    bind placeholder); pass ``None`` to leave a source out — ``signals_col=None`` for a
+    two-column table like ``mental_models`` (name + content), both for an observation,
+    whose ``search_vector`` covers its text alone. Pass ``native_inline=False`` when the
     table's native ``search_vector`` is a GENERATED column that populates itself
     (``mental_models``) — writing it inline would fail; only vchord's plain
     bm25vector column then needs an explicit value.
@@ -50,7 +51,7 @@ def pg_search_vector_expr(
     ``text_search_extension_native_language`` is validated as a PG identifier in
     ``HindsightConfig.validate()``, so embedding it as a SQL literal is safe.
     """
-    cols = [text_col, context_col] + ([signals_col] if signals_col is not None else [])
+    cols = [c for c in (text_col, context_col, signals_col) if c is not None]
     combined = " || ' ' || ".join(f"COALESCE({c}, '')" for c in cols)
     if config.text_search_extension == "vchord":
         return f"tokenize({combined}, 'llmlingua2')::bm25_catalog.bm25vector"
@@ -831,21 +832,22 @@ class PostgreSQLOps(DataAccessOps):
         # made each per-row check cheaper; it kept the per-row structure, so the
         # product blew up again at scale.
         #
-        # `live` groups unit_entities by unit (self-join on unit_id) to emit every
-        # co-occurring (e1<e2) pair in one materialised pass: its cost is driven
-        # by unit degree (entities per unit — small), never by entity degree, so a
-        # hub contributes only its per-unit membership rather than a rescan per
-        # edge. The victims anti-join then hashes against it. MATERIALIZED keeps
-        # the planner from inlining `live` back into a per-row correlated plan.
+        # `live` is built in one materialised pass from unit_entities (self-join
+        # on unit_id), so cost is driven by unit membership, never by a rescan
+        # per edge. The victims anti-join then hashes against it. MATERIALIZED
+        # keeps the planner from inlining `live` back into a per-row correlated
+        # plan.
         #
-        # `live` is seeded from the *candidates'* units rather than the whole
-        # bank's (#3222 composed with #3367): graph maintenance is queue-driven,
-        # so this only has to decide about pairs in `incident`, and every such
-        # pair has a candidate as at least one endpoint. Any unit still
-        # witnessing such a pair therefore references a candidate, and so is in
-        # the seeded set — the scoped build cannot miss a live pair. That keeps
-        # the whole statement proportional to the batch instead of re-deriving
-        # every pair in the bank on every run.
+        # `live` holds only the pairs a *candidate* forms inside its own units
+        # (#3222 composed with #3367), normalised to (LEAST, GREATEST) to match
+        # entity_cooccurrences' entity_id_1 < entity_id_2 order. That is all the
+        # anti-join needs: every pair in `incident` has a candidate endpoint,
+        # and such a pair is live exactly when one of that candidate's units
+        # also holds the other endpoint. Emitting every pair of every candidate
+        # unit instead (the previous shape) gives the same victims, but around
+        # a hub it also expands all the non-candidate pairs of the hub's units,
+        # several times more rows for nothing. Duplicate pairs (both endpoints
+        # candidates, or several shared units) are harmless to the anti-join.
         result = await conn.execute(
             f"""
             WITH incident AS MATERIALIZED (
@@ -858,12 +860,12 @@ class PostgreSQLOps(DataAccessOps):
                 WHERE c.entity_id_2 = ANY($1::uuid[])
             ),
             live AS MATERIALIZED (
-                SELECT u1.entity_id AS e1, u2.entity_id AS e2
-                FROM {ue_table} seed
-                JOIN {ue_table} u1 ON u1.unit_id = seed.unit_id
-                JOIN {ue_table} u2 ON u2.unit_id = u1.unit_id
-                                  AND u2.entity_id > u1.entity_id
-                WHERE seed.entity_id = ANY($1::uuid[])
+                SELECT LEAST(s.entity_id, u.entity_id) AS e1,
+                       GREATEST(s.entity_id, u.entity_id) AS e2
+                FROM {ue_table} s
+                JOIN {ue_table} u ON u.unit_id = s.unit_id
+                                 AND u.entity_id <> s.entity_id
+                WHERE s.entity_id = ANY($1::uuid[])
             ),
             victims AS (
                 SELECT c.entity_id_1, c.entity_id_2
@@ -1638,7 +1640,7 @@ class PostgreSQLOps(DataAccessOps):
         if claimed_ids:
             return await conn.fetch(
                 f"""
-                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
                 FROM {table} o
                 WHERE o.status = 'pending'
                   AND o.task_payload IS NOT NULL
@@ -1655,7 +1657,7 @@ class PostgreSQLOps(DataAccessOps):
             )
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1696,7 +1698,7 @@ class PostgreSQLOps(DataAccessOps):
         extra = " AND ".join(conditions)
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1738,7 +1740,7 @@ class PostgreSQLOps(DataAccessOps):
         extra_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1764,7 +1766,7 @@ class PostgreSQLOps(DataAccessOps):
         """
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1864,7 +1866,7 @@ class PostgreSQLOps(DataAccessOps):
                 SELECT * FROM rot UNION ALL SELECT * FROM fifo
             )
             SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count,
-                   o.serialization_key, o.bank_id, c.tier
+                   o.serialization_key, o.bank_id, o.created_at, c.tier
             FROM cand c
             JOIN {table} o ON o.operation_id = c.operation_id
             WHERE {claimable}

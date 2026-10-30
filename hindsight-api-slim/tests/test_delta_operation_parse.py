@@ -345,6 +345,29 @@ _UNKNOWN_SECTION = '{"operations": [{"op": "append_block", "section_id": "gone",
 _KNOWN_SECTION = '{"operations": [{"op": "append_block", "section_id": "prefs", "text": "ok"}]}'
 
 
+async def test_request_delta_operations_asks_again_when_an_op_spills_beside_the_array():
+    """An operation written as top-level keys next to ``operations`` used to be dropped silently.
+
+    Now the reply is refused and the retry names the stray keys, so the model can
+    put the operation back inside the array.
+    """
+    spilled = json.dumps(
+        {
+            "operations": [{"op": "append_block", "section_id": "s", "text": "kept"}],
+            "op": "append_block",
+            "section_id": "s",
+            "text": "dropped",
+        }
+    )
+    with pytest.raises(ValueError, match="beside operations"):
+        parse_delta_operation_list(spilled)
+    llm = _ScriptedLLM(spilled, _GOOD)
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+    assert len(op_list.operations) == 1
+    assert len(llm.calls) == 2
+    assert "['op', 'section_id', 'text']" in llm.calls[1][3]["content"]
+
+
 async def test_request_delta_operations_asks_again_when_no_op_reaches_the_document():
     """#4206: a well-formed reply whose every op names a missing section used to fail
     the refresh and be retried with the same prompt. It now gets the same one retry,
@@ -477,3 +500,42 @@ async def test_request_delta_operations_replays_a_validated_reply_as_text():
 
     assert len(llm.calls) == 2
     assert op_list.operations[0].section_id == "prefs"
+
+
+# A bare array that arrives parsed -------------------------------------------
+
+# The #3820 bare-array reply, as an OpenAI-compatible provider hands it over under
+# ``skip_validation``: already a list, which used to reach ``(raw or "").strip()``.
+_GOOD_ARRAY_PARSED = json.loads(_GOOD)["operations"]
+_STRAY_ARRAY_PARSED = json.loads(_STRAY)["operations"]
+
+
+def test_parse_delta_operation_list_parsed_top_level_array():
+    op_list = parse_delta_operation_list(_GOOD_ARRAY_PARSED)
+    assert len(op_list.operations) == 1
+    assert isinstance(op_list.operations[0], AppendBlockOp)
+    assert op_list.operations[0].section_id == "s"
+
+
+def test_parse_delta_operation_list_parsed_top_level_array_is_refused_the_same_way():
+    with pytest.raises(DeltaOperationsInvalidError):
+        parse_delta_operation_list(_STRAY_ARRAY_PARSED)
+
+
+def test_parse_delta_operation_list_other_parsed_types_raise_type_error():
+    """Anything that is neither text, an object nor an array is refused with an error
+    the ask-again path catches, never with an AttributeError that bypasses it."""
+    with pytest.raises(TypeError):
+        parse_delta_operation_list(42)
+
+
+async def test_request_delta_operations_asks_again_after_a_refused_parsed_array():
+    """The refused parsed array gets the one corrective retry, quoted back as JSON text."""
+    llm = _ScriptedLLM(_STRAY_ARRAY_PARSED, _GOOD_ARRAY_PARSED)
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+
+    assert len(llm.calls) == 2
+    replayed = llm.calls[1][2]
+    assert replayed["role"] == "assistant"
+    assert json.loads(replayed["content"]) == _STRAY_ARRAY_PARSED
+    assert op_list.operations[0].section_id == "s"

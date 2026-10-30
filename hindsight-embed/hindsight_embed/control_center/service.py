@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 
 from .. import daemon_client
 from .._http_probe import ProbeResponse, probe_get
-from ..profile_manager import ENV_API_PORT, ENV_CP_PORT, ProfileManager
+from ..profile_manager import ENV_API_PORT, ENV_CP_PORT, ProfileManager, parse_env_file
 
 # Env var names the wizard owns. Writing config replaces these; everything else
 # in the profile (idle timeout, bank id, custom keys) is preserved untouched.
@@ -159,22 +159,7 @@ def _mask_key(key: str | None) -> str | None:
 
 def _read_raw_env(name: str) -> dict[str, str]:
     """Parse a profile's .env into real env-var keys only (no simple aliases)."""
-    pm = ProfileManager()
-    path = pm.resolve_profile_paths(name).config
-    env: dict[str, str] = {}
-    if not path.exists():
-        return env
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:]
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        env[key.strip()] = value.strip()
-    return env
+    return parse_env_file(ProfileManager().resolve_profile_paths(name).config)
 
 
 def _write_raw_env(name: str, env: dict[str, str]) -> None:
@@ -429,7 +414,6 @@ def write_env_file(name: str, content: str) -> EnvFileView:
 # --------------------------------------------------------------------------
 def get_profile_paths(name: str) -> ProfilePathsView:
     """Resolve the on-disk references and URLs for a profile."""
-    import os
     from pathlib import Path
 
     from .. import get_embed_manager
@@ -438,7 +422,7 @@ def get_profile_paths(name: str) -> ProfilePathsView:
     paths = ProfileManager().resolve_profile_paths(name)
 
     # Honor the same DB override the daemon uses, else the per-profile pg0.
-    database_url = os.getenv("HINDSIGHT_EMBED_API_DATABASE_URL") or get_embed_manager().get_database_url(name)
+    database_url = get_embed_manager().resolve_database_url(name)
     database_path: str | None = None
     if database_url.startswith("pg0://"):
         instance = database_url.removeprefix("pg0://")

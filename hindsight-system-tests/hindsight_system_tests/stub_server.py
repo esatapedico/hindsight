@@ -9,6 +9,10 @@ even know it exists. Three environment variables point the real server here:
     HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL -> /rerank
     HINDSIGHT_API_RERANKER_TYPESAFE_BASE_URL     -> /v1/systemone
 
+With ``HINDSIGHT_API_LLM_PROVIDER=anthropic`` the same base URL serves the
+Anthropic Messages API (``/v1/messages``) and its Workload Identity Federation
+token exchange (``/v1/oauth/token``), answered from the same rulebook.
+
 Which means the tests exercise the production provider code for real — the
 OpenAI client, the JSON-repair path, the retry and rate-limit handling, the
 structured-output plumbing. An in-process fake replaces all of that with
@@ -18,17 +22,59 @@ there.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
+from dataclasses import dataclass
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .lexical import EMBEDDING_DIMENSION
-from .rulebook import ChatRequest, ReceivedWebhook, Stubs
+from .rulebook import ChatRequest, ReceivedWebhook, Stubs, TokenExchange
 from .validation import RequestRejected, validate_chat, validate_embeddings, validate_rerank, validate_systemone
 
 logger = logging.getLogger(__name__)
+
+
+#: The words Hindsight asks for a forced (named) call with (``tools_via_schema.turn_request``).
+_NAMED_TURN_RX = re.compile(r"^Call `([^`]+)` now")
+
+
+@dataclass(frozen=True)
+class SchemaToolTurn:
+    """A tool-calling turn made as a reply to a response schema, as Hindsight makes every one.
+
+    No ``tools`` are sent (``providers/tools_via_schema.py``): a free turn's schema is
+    ``{"call": one of the declared functions with its arguments}``, and a forced turn's is
+    that function's arguments, asked for in words. Rules keep scripting tool calls; the
+    call they return is written back as the JSON text the schema holds the reply to.
+    """
+
+    tools: tuple[str, ...]
+    named: bool
+
+    def reply_for(self, function: dict[str, Any]) -> dict[str, Any]:
+        arguments = json.loads(function.get("arguments") or "{}")
+        payload = arguments if self.named else {"call": {"name": function["name"], "arguments": arguments}}
+        return {"role": "assistant", "content": json.dumps(payload)}
+
+
+def _schema_tool_turn(body: dict[str, Any]) -> SchemaToolTurn | None:
+    """Recognised by shape: the provider names every response schema alike ("response")."""
+    schema = ((body.get("response_format") or {}).get("json_schema") or {}).get("schema") or {}
+    properties = schema.get("properties") or {}
+    if set(properties) == {"call"} and "anyOf" in properties["call"]:
+        options = properties["call"]["anyOf"]
+        return SchemaToolTurn(tools=tuple(o["properties"]["name"]["enum"][0] for o in options), named=False)
+    last = (body.get("messages") or [{}])[-1]
+    content = last.get("content")
+    match = _NAMED_TURN_RX.match(content) if schema and isinstance(content, str) else None
+    if match:
+        return SchemaToolTurn(tools=(match.group(1),), named=True)
+    return None
 
 
 def create_stub_app(stubs: Stubs) -> FastAPI:
@@ -48,10 +94,14 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
         body = await request.json()
         validate_chat(body)
 
+        turn = _schema_tool_turn(body)
         chat_request = ChatRequest(
             model=body["model"],
             messages=body["messages"],
-            tools=tuple(tool["function"]["name"] for tool in body.get("tools") or []),
+            # Hindsight sends no ``tools``: a tool turn is a reply to a response schema.
+            tools=turn.tools if turn else (),
+            api_key=request.headers.get("authorization", "").removeprefix("Bearer ") or None,
+            headers={k.lower(): v for k, v in request.headers.items()},
         )
 
         reply = stubs.llm.resolve(chat_request)
@@ -75,8 +125,15 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
 
         if reply.error_status is not None:
             return _provider_error(
-                f"stub provider error {reply.error_status}", code="stub_error", status=reply.error_status
+                f"stub provider error {reply.error_status}",
+                code="stub_error",
+                status=reply.error_status,
+                retry_after_seconds=reply.retry_after_seconds,
             )
+
+        message, finish_reason = reply.message, reply.finish_reason
+        if turn is not None and message.get("tool_calls"):
+            message, finish_reason = turn.reply_for(message["tool_calls"][0]["function"]), "stop"
 
         return JSONResponse(
             {
@@ -84,15 +141,74 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": body["model"],
-                "choices": [
-                    {"index": 0, "message": reply.message, "finish_reason": reply.finish_reason, "logprobs": None}
-                ],
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason, "logprobs": None}],
                 "usage": _usage(
                     chat_request.all_text,
-                    str(reply.message.get("content") or ""),
+                    str(message.get("content") or ""),
                     visible_tokens=reply.visible_tokens,
                     reasoning_tokens=reply.reasoning_tokens,
                 ),
+            }
+        )
+
+    @app.post("/v1/oauth/token")
+    async def oauth_token(request: Request) -> JSONResponse:
+        """The Workload Identity Federation exchange: identity token in, access token out.
+
+        The issued token is numbered, so a story can tell which exchange a later call's
+        bearer came from. An hour's lifetime keeps the SDK from re-exchanging mid-story.
+        """
+        body = await request.json()
+        exchange = TokenExchange(
+            assertion=body["assertion"],
+            federation_rule_id=body["federation_rule_id"],
+            organization_id=body["organization_id"],
+            service_account_id=body.get("service_account_id"),
+            access_token=f"stub-wif-access-{len(stubs.token_exchanges) + 1}",
+        )
+        stubs.token_exchanges.append(exchange)
+        return JSONResponse({"access_token": exchange.access_token, "token_type": "Bearer", "expires_in": 3600})
+
+    @app.post("/v1/messages")
+    async def messages(request: Request) -> JSONResponse:
+        """The Anthropic Messages API, answered from the chat-completions rulebook.
+
+        The request is translated into a ``ChatRequest`` (the separate ``system`` field
+        becomes a leading system message, so step anchors in it still match), and the
+        rule's text reply back into an Anthropic text block. Tool-use turns are not
+        translated yet: no story drives reflect through this provider.
+        """
+        body = await request.json()
+        system = body.get("system")
+        prefix = [{"role": "system", "content": system}] if system else []
+        authorization = request.headers.get("authorization", "")
+        chat_request = ChatRequest(
+            model=body["model"],
+            messages=[*prefix, *body["messages"]],
+            tools=tuple(tool["name"] for tool in body.get("tools") or []),
+            api_key=authorization.removeprefix("Bearer ") or request.headers.get("x-api-key"),
+            headers={k.lower(): v for k, v in request.headers.items()},
+        )
+
+        reply = stubs.llm.resolve(chat_request)
+        if reply is None:
+            unmatched = stubs.llm.unmatched[-1]
+            logger.error("No stub rule matched: %s", unmatched.suggestion())
+            return _anthropic_error(f"No stub rule matched this call. Add one:\n    {unmatched.suggestion()}", 400)
+        if reply.error_status is not None:
+            return _anthropic_error(f"stub provider error {reply.error_status}", reply.error_status)
+
+        usage = _usage(chat_request.all_text, str(reply.message.get("content") or ""))
+        return JSONResponse(
+            {
+                "id": "msg-stub",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"],
+                "content": [{"type": "text", "text": reply.message["content"]}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
             }
         )
 
@@ -100,6 +216,9 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
     async def embeddings(request: Request) -> JSONResponse:
         body = await request.json()
         validate_embeddings(body)
+        if stubs.embeddings.fail_with_status is not None:
+            status = stubs.embeddings.fail_with_status
+            return _provider_error(f"stub provider error {status}", code="stub_error", status=status)
 
         raw_input = body["input"]
         inputs = [raw_input] if isinstance(raw_input, str) else raw_input
@@ -140,17 +259,63 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
     async def systemone(request: Request) -> JSONResponse:
         """TypeSafe's typed-question endpoint.
 
-        Two question types reach it. A ``choice`` whose options are the candidates
-        is the ranking: every option gets a probability, and they sum to 1, so the
-        stub scores each option's text lexically and normalises. A ``score`` is the
-        cut: its answer is a level, and the rulebook decides which one.
+        A ``choice`` whose options are the candidates is the ranking: every option
+        gets a probability, and they sum to 1, so the stub scores each option's text
+        lexically and normalises, except the ``impact`` choice, a delta refresh's gate,
+        which is the rulebook's verdict on the memory as yes or no. A ``noul`` asks about one memory, and is answered
+        with the rulebook's verdict for it, else its lexical relevance to the state; one about
+        two memories (recall's dedup) with the rulebook's repeats. A
+        ``score`` is the cut: its answer is a level, and the rulebook decides which
+        one.
         """
         body = await request.json()
         validate_systemone(body)
 
         answers = {}
+        state = body["state"]
+        if isinstance(state, dict) and "new_fact" in state:
+            # Consolidation triage: the verdict is scripted per fact (see TriageStub).
+            fact_text = state["new_fact"]["text"]
+            relation = stubs.triage.relation(fact_text)
+            fits = stubs.triage.fits(fact_text)
+            yes = {"covers_o0": relation == "restates"}
+            for question_id, question in body["questions"].items():
+                if question_id == "relation":
+                    pick = relation
+                elif question_id == "keep_as":
+                    pick = "as_stated" if fits else "reworded"
+                elif set(question["criteria"]) == {"yes", "no"}:
+                    pick = "yes" if yes.get(question_id, False) else "no"
+                else:
+                    pick = next(iter(question["criteria"]))
+                probabilities = {key: (0.99 if key == pick else 0.0) for key in question["criteria"]}
+                answers[question_id] = {"type": "choice", "choice": pick, "probabilities": probabilities}
+            return JSONResponse({"model": "stub", "answers": answers, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
         for question_id, question in body["questions"].items():
-            if question["type"] == "choice":
+            if question["type"] == "noul" and "memory_a" in question["instructions"]:
+                instructions = question["instructions"]
+                answers[question_id] = {
+                    "type": "noul",
+                    "noul": stubs.rerank.repeat(instructions["memory_a"], instructions["memory_b"]),
+                }
+            elif question["type"] == "noul":
+                memory = question["instructions"]["memory"]
+                stubs.rerank.states.append(body["state"])
+                answers[question_id] = {"type": "noul", "noul": stubs.rerank.verdict(body["state"], memory)}
+            elif question_id == "impact":
+                # A delta refresh's gate: could this new memory change the page? The memory
+                # is a line of the state, and the rulebook's verdict for it decides.
+                memory = body["state"].split("New memory: ", 1)[1].split("\n", 1)[0]
+                stubs.rerank.states.append(body["state"])
+                keep = stubs.rerank.verdict(body["state"], memory) >= 0.5
+                answers[question_id] = {
+                    "type": "choice",
+                    "choice": "yes" if keep else "no",
+                    "probabilities": {"yes": 0.9, "no": 0.1} if keep else {"yes": 0.1, "no": 0.9},
+                    "confidence": 0.9,
+                }
+            elif question["type"] == "choice":
                 criteria = question["criteria"]
                 scores = {
                     key: stubs.rerank.score(body["state"], text if isinstance(text, str) else str(text))
@@ -205,9 +370,19 @@ def _usage(
     return usage
 
 
-def _provider_error(message: str, *, code: str, status: int = 400) -> JSONResponse:
+def _provider_error(
+    message: str, *, code: str, status: int = 400, retry_after_seconds: int | None = None
+) -> JSONResponse:
     """The error envelope OpenAI-compatible clients expect, so the SDK parses it."""
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": "invalid_request_error", "code": code, "param": None}},
+        headers={"retry-after": str(retry_after_seconds)} if retry_after_seconds is not None else None,
+    )
+
+
+def _anthropic_error(message: str, status: int) -> JSONResponse:
+    """The error envelope the Anthropic SDK parses."""
+    return JSONResponse(
+        status_code=status, content={"type": "error", "error": {"type": "invalid_request_error", "message": message}}
     )

@@ -6,8 +6,9 @@ is this provider's whole substance. The HTTP round trip is faked; what is assert
 the requests we build and the order and cut we derive from the answers.
 """
 
+import json as jsonlib
 from contextlib import asynccontextmanager
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +19,7 @@ from hindsight_api.engine.cross_encoder import (
     TypeSafeCrossEncoder,
     create_cross_encoder_from_env,
 )
+from hindsight_api.engine.aiohttp_session import UpstreamHTTPError
 from hindsight_api.engine.token_encoding import count_tokens
 
 
@@ -41,11 +43,16 @@ class _FakeSession:
     real API would answer it.
     """
 
+    # Set to refuse a body the way Jev does when it counts it over its window. Jev counts
+    # mixed-script text at twice our tokenizer (#5715), so the window here does too.
+    window: int | None = None
+
     def __init__(self, ranking: dict[str, float], cut_level: float = 0.0):
         self.ranking = ranking
         self.cut_level = cut_level
         self.posted: list[dict] = []
         self.urls: list[str] = []
+        self.refused: list[dict] = []
 
     def get(self):
         return self
@@ -73,6 +80,9 @@ class _FakeSession:
         yield _FakeResponse({"answers": {question_id: answer}, "usage": {"input_tokens": 1, "output_tokens": 1}})
 
     def post(self, url, headers=None, json=None):
+        if self.window is not None and 2 * count_tokens(jsonlib.dumps(json)) > self.window:
+            self.refused.append(json)
+            raise UpstreamHTTPError(400, '{"detail":{"error_type":"max_tokens_exceeded"}}', {}, url)
         return self._post(url, headers=headers, json=json)
 
     @property
@@ -171,6 +181,22 @@ class TestRanking:
         assert session.posted == []
 
 
+class TestTracing:
+    @pytest.mark.asyncio
+    async def test_each_request_is_traced_as_a_decision_and_predict_adds_no_rerank_row(self):
+        """The System One requests are the billed calls; one rerank row on top would count them twice."""
+        encoder, _ = _encoder({"c0": 0.9, "c1": 0.1}, prune_candidates=True)
+        calls: list[dict] = []
+        recorder = type("R", (), {"record_llm_call": lambda self, **kw: calls.append(kw)})()
+        with patch("hindsight_api.engine.decision_model.get_span_recorder", return_value=recorder):
+            with patch("hindsight_api.engine.llm_trace.get_span_recorder", return_value=recorder):
+                await encoder.predict([("q", "a"), ("q", "b")])
+
+        assert [c["scope"] for c in calls] == ["decision_rank", "decision_cut"]
+        assert all(c["provider"] == "typesafe" and c["input_tokens"] == 1 for c in calls)
+        assert all("questions" in c["structured_input"] for c in calls)
+
+
 class TestChunking:
     @pytest.mark.asyncio
     async def test_a_pool_over_the_option_cap_is_ranked_in_rounds(self):
@@ -247,8 +273,125 @@ class TestCut:
         assert all(score > 0.0 for score in scores)
 
 
+class _SufficiencySession(_FakeSession):
+    """Answers the sufficiency Score with a fixed expected score and per-level probabilities."""
+
+    def __init__(self, score: float, probabilities: dict[str, float] | None):
+        super().__init__({})
+        self.score = score
+        self.probabilities = probabilities
+
+    @asynccontextmanager
+    async def _post(self, url, headers=None, json=None):
+        self.posted.append(json)
+        answer = {"type": "score", "score": self.score, "confidence": 0.5}
+        if self.probabilities is not None:
+            answer["probabilities"] = self.probabilities
+        yield _FakeResponse({"answers": {"sufficient": answer}})
+
+
+class TestSufficiency:
+    @staticmethod
+    async def _verdict(score: float, probabilities: dict[str, float] | None) -> bool:
+        encoder = TypeSafeCrossEncoder(api_key="k")
+        encoder._session = _SufficiencySession(score, probabilities)
+        return await encoder.evidence_is_sufficient("q", "evidence")
+
+    @pytest.mark.asyncio
+    async def test_the_likeliest_level_decides_not_the_rounded_score(self):
+        """Measured on sde-bench: expected 1.43 rounds to "partly", but "fully" was likeliest."""
+        assert await self._verdict(1.43, {"0": 0.10, "1": 0.36, "2": 0.54}) is True
+
+    @pytest.mark.asyncio
+    async def test_partly_is_not_enough(self):
+        assert await self._verdict(1.13, {"0": 0.02, "1": 0.84, "2": 0.14}) is False
+
+    @pytest.mark.asyncio
+    async def test_without_probabilities_the_score_is_rounded(self):
+        assert await self._verdict(1.6, None) is True
+        assert await self._verdict(1.4, None) is False
+
+
+class _PageImpactSession(_FakeSession):
+    """Answers the page-impact choice with a fixed answer and records each request."""
+
+    def __init__(self, answer: dict):
+        super().__init__({})
+        self.answer = answer
+
+    @asynccontextmanager
+    async def _post(self, url, headers=None, json=None):
+        self.posted.append(json)
+        yield _FakeResponse({"answers": {"impact": {"type": "choice", **self.answer}}})
+
+
+@dataclass(frozen=True)
+class _PageImpactCall:
+    verdict: bool
+    request: dict
+
+
+class TestPageImpact:
+    @staticmethod
+    async def _ask(answer: dict, page: str = "# Page\n\nDana is on call.") -> _PageImpactCall:
+        encoder = TypeSafeCrossEncoder(api_key="k")
+        session = _PageImpactSession(answer)
+        encoder._session = session
+        verdict = await encoder.could_change_page("Who is on call?", page, "Dana left the company.")
+        return _PageImpactCall(verdict=verdict, request=session.posted[0])
+
+    @pytest.mark.asyncio
+    async def test_no_drops_the_memory(self):
+        assert (await self._ask({"choice": "no", "probabilities": {"yes": 0.1, "no": 0.9}})).verdict is False
+
+    @pytest.mark.asyncio
+    async def test_yes_keeps_it(self):
+        assert (await self._ask({"choice": "yes"})).verdict is True
+
+    @pytest.mark.asyncio
+    async def test_without_a_choice_the_likeliest_option_decides(self):
+        assert (await self._ask({"probabilities": {"yes": 0.2, "no": 0.8}})).verdict is False
+
+    @pytest.mark.asyncio
+    async def test_an_empty_answer_keeps_it(self):
+        """A wrong "no" is permanent, a wrong "yes" costs one LLM call: doubt keeps."""
+        assert (await self._ask({})).verdict is True
+
+    @pytest.mark.asyncio
+    async def test_the_state_carries_topic_memory_and_page(self):
+        body = (await self._ask({"choice": "yes"})).request
+        state = body["state"]
+        assert "Who is on call?" in state and "Dana left the company." in state and "Dana is on call." in state
+        criteria = set(body["questions"]["impact"]["criteria"])
+        assert {"yes", "no"} <= criteria and len(criteria) > 2
+
+    @pytest.mark.asyncio
+    async def test_a_hedged_answer_keeps_it(self):
+        """Every option but "no" keeps the memory, so a doubt split across them never drops it."""
+        assert (await self._ask({"choice": "maybe"})).verdict is True
+        assert (await self._ask({"choice": "no"})).verdict is False
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_page_keeps_its_head(self):
+        page = "HEAD " + "filler " * 40_000 + "TAIL"
+        body = (await self._ask({"choice": "yes"}, page=page)).request
+        assert "HEAD" in body["state"] and "TAIL" not in body["state"]
+        assert count_tokens(body["state"]) <= TypeSafeCrossEncoder.MAX_QUESTION_TOKENS
+
+
+class TestMinKeep:
+    @pytest.mark.asyncio
+    async def test_the_cut_never_keeps_fewer_than_the_floor(self):
+        """Level 0 keeps one; a floor of three keeps the top three by rank."""
+        encoder, _ = _encoder({"c0": 0.1, "c1": 0.4, "c2": 0.3, "c3": 0.2}, cut_level=0.0, prune_candidates=True)
+        encoder.MIN_KEEP = 3
+        scores = await encoder._predict([("q", "a"), ("q", "b"), ("q", "c"), ("q", "d")])
+
+        assert [score > 0 for score in scores] == [False, True, True, True]
+
+
 class TestFactory:
-    def test_provider_is_built_from_config(self):
+    def test_provider_is_built_from_config(self, caplog):
         config = _make_config(
             reranker_provider="typesafe",
             reranker_typesafe_api_key="k",
@@ -263,6 +406,8 @@ class TestFactory:
         assert encoder.provider_name == "typesafe"
         assert encoder.model == "jev-latest"
         assert encoder.prunes_candidates is True
+        # Deprecated in favour of the shared decision model; building it says so.
+        assert "HINDSIGHT_API_DECISION_MODEL_PROVIDER" in caplog.text
 
     def test_missing_api_key_names_its_env_var(self):
         config = _make_config(reranker_provider="typesafe")
@@ -527,3 +672,39 @@ class TestTokenBudgetingAndOrder:
 
         assert len(scores) == size
         assert all(len(body["questions"]["rank"]["criteria"]) <= 10 for body in session.rank_requests)
+
+
+class TestOverflowingJevsWindow:
+    """A request sized to fit by our count can still be over Jev's window by its own (#5715).
+    It is rebuilt at half the budget until Jev takes it."""
+
+    @pytest.mark.asyncio
+    async def test_the_pool_is_repacked_smaller_and_every_candidate_ranked(self):
+        size = 20
+        encoder, session = _encoder({f"c{i}": 1.0 / (i + 1) for i in range(size)})
+        session.window = 32_000
+        docs = [f"{i} " + "long document words " * 300 for i in range(size)]  # ~20k tokens: one group by our count
+
+        scores = await encoder._predict([("q", doc) for doc in docs])
+
+        assert session.refused, "the first request must have been over the window for this to mean anything"
+        assert all(2 * count_tokens(jsonlib.dumps(body)) <= 32_000 for body in session.posted)
+        assert len(set(scores)) == size, "every candidate keeps a distinct rank"
+
+    @pytest.mark.asyncio
+    async def test_evidence_is_cut_shorter_until_it_fits(self):
+        encoder = TypeSafeCrossEncoder(api_key="k")
+        session = _SufficiencySession(2.0, None)
+        session.window = 32_000
+        encoder._session = session
+
+        assert await encoder.evidence_is_sufficient("q", "evidence words " * 20_000) is True
+        assert len(session.refused) == 1 and len(session.posted) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_request_that_never_fits_raises(self):
+        encoder, session = _encoder({"c0": 0.6, "c1": 0.4})
+        session.window = 100
+        with pytest.raises(UpstreamHTTPError, match="max_tokens_exceeded"):
+            await encoder._predict([("q", "a"), ("q", "b")])
+        assert len(session.refused) == 4, "26k, 13k, 6.5k, 3.25k — then it gives up"

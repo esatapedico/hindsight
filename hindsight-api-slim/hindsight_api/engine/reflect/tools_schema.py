@@ -1,7 +1,8 @@
 """
 Tool schema definitions for the reflect agent.
 
-These are OpenAI-format tool definitions used with native tool calling.
+These are OpenAI-format tool definitions; the model calls them through a response schema
+(see providers/tools_via_schema.py), never as native tool calls.
 The reflect agent uses a hierarchical retrieval strategy:
 1. search_mental_models - User-curated stored reflect responses (highest quality, if applicable)
 2. search_observations - Consolidated knowledge with freshness awareness
@@ -9,6 +10,8 @@ The reflect agent uses a hierarchical retrieval strategy:
 """
 
 import copy
+
+from .prompts import NO_IDS_IN_TEXT_RULE
 
 # Tool definitions in OpenAI format
 
@@ -19,9 +22,10 @@ TOOL_SEARCH_MENTAL_MODELS = {
         "description": (
             "Search user-curated mental models (stored reflect responses). These are high-quality, manually created "
             "summaries about specific topics. Use FIRST when the question might be covered by an "
-            "existing mental model. Returns the best-matching page IN FULL, and a SNIPPET of each other hit "
-            "with its size and last refresh time — call read_mental_models to read in full any of those that "
-            "look like they answer the question."
+            "existing mental model. Returns the best-matching pages IN FULL (`content`) as far as a token budget "
+            "allows, and only a SNIPPET (`snippet`, the page opening) of each other hit with its size and last "
+            "refresh time — call read_mental_models to read in full any of those that look like they answer "
+            "the question."
         ),
         "parameters": {
             "type": "object",
@@ -133,8 +137,8 @@ TOOL_READ_MENTAL_MODELS = {
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "description": "Token budget for the pages returned (default 6000). Reading stops at the "
-                    "first page that would cross it; the rest come back under not_read.",
+                    "description": "Token budget for the pages returned (default 6000). A page that would "
+                    "cross it is not read and comes back under not_read; the first page is always read.",
                 },
             },
             "required": ["reason", "mental_model_ids"],
@@ -188,13 +192,26 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
 #: merely shared the question's topic read as enough, and the reflect loop had
 #: already released the forced lower layers (see agent.py's short-circuit, and
 #: #4567). The retrieval-levels section of the system prompt carries the same
-#: rule once; this is the copy at the decision point.
+#: rule once; this is the copy at the decision point. Measured on the reporter's
+#: banks, this wording alone did not make the model recall before a negative, so
+#: the absence half is also enforced in code through ``answer_found`` below.
 _DONE_SUFFICIENCY_GATE = (
     " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
     "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
     "instead of answering around it. Never call done to report that nothing is known unless recall has already "
     "run on the question's key terms."
 )
+
+#: The model's own verdict on whether it found the answer. Prose can't be
+#: checked, a bool can: when it is false and recall has not run yet, the agent
+#: loop refuses the ``done`` and forces a recall first (#4567).
+_DONE_ANSWER_FOUND_PROPERTY = {
+    "type": "boolean",
+    "description": (
+        "true if what you retrieved states the answer to the question. false if you are reporting that "
+        "nothing (or not enough) is known about it."
+    ),
+}
 
 TOOL_DONE_ANSWER = {
     "type": "function",
@@ -230,83 +247,55 @@ TOOL_DONE_ANSWER = {
                     "items": {"type": "string"},
                     "description": "Array of observation IDs that support your answer",
                 },
+                "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
             },
-            "required": ["answer"],
+            "required": ["answer", "answer_found"],
         },
     },
 }
 
 
-# Document mode: the answer IS the stored document, so the model emits its
-# structure and the markdown is rendered from it. Nothing the model writes is
-# ever parsed back into structure, which is the whole point — a document that is
-# generated as markdown and read back is a document that can be misread, and was
-# (#3361). See ``structured_doc`` for the schema this mirrors.
-#
-# Deliberately flat: an array of sections, each an array of block strings. No
-# union types, no ``oneOf`` — a tool schema goes to the provider verbatim and not
-# every provider accepts a discriminated union (Gemini rejects ``oneOf``), and a
-# shape the model can fill without thinking is a shape it fills correctly.
-_DONE_DOCUMENT_PROPERTY = {
-    "type": "object",
+# The same document, written as markdown and split into sections by its headings
+# (``structured_doc.split_markdown``, lossless). For a forced done asked for through a
+# response schema: a model held to the grammar wrote the nested section array thinner
+# than it writes markdown, and a judge preferred the markdown pages (98 to 37, against
+# 65 to 63 for the same request twice).
+_DONE_MARKDOWN_PROPERTY = {
+    "type": "string",
     "description": (
-        "Your response as a structured document. The markdown the user reads is rendered "
-        "from this — do NOT write a markdown document yourself."
+        "Your response as a markdown document: a '## ' heading per section, then its paragraphs, "
+        "lists, tables or code fences. " + NO_IDS_IN_TEXT_RULE
     ),
-    "properties": {
-        "sections": {
-            "type": "array",
-            "description": "The document's sections, in order.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "heading": {
-                        "type": "string",
-                        "description": (
-                            "Heading text WITHOUT any leading '#'. Empty string for an "
-                            "opening section that should render with no heading."
-                        ),
-                    },
-                    "level": {
-                        "type": "integer",
-                        "description": "Heading level, 1-6. Use 2 unless the document needs deeper nesting.",
-                    },
-                    "blocks": {
-                        "type": "array",
-                        "description": (
-                            "The section's content, one entry per block: a single paragraph, a single "
-                            "list, a single table, or a single fenced code block. Never put two "
-                            "paragraphs in one entry, and never put a heading in one — headings are the "
-                            "'heading' field. Within an entry, write the content as you would in a "
-                            "document: '- one\n- two' for a list, "
-                            "'| a | b |\n| --- | --- |\n| 1 | 2 |' for a table."
-                        ),
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": ["heading", "level", "blocks"],
-            },
-        }
-    },
-    "required": ["sections"],
 }
 
 
-def _done_tool_for_document(base: dict) -> dict:
-    """Swap a done tool's free-text ``answer`` for a structured ``document``."""
+def _done_tool_for_markdown_document(base: dict) -> dict:
+    """Swap a done tool's free-text ``answer`` for the document as ``markdown``.
+
+    The fields run answer_found, markdown, then the cited ids: a schema-enforced reply
+    is written in field order, so the citations come after the text they support.
+    """
     tool = copy.deepcopy(base)
     params = tool["function"]["parameters"]
-    params["properties"].pop("answer", None)
-    params["properties"]["document"] = _DONE_DOCUMENT_PROPERTY
-    params["required"] = ["document"] + [name for name in params.get("required", []) if name != "answer"]
+    properties = params["properties"]
+    properties.pop("answer", None)
+    ids = {name: prop for name, prop in properties.items() if name.endswith("_ids")}
+    rest = {name: prop for name, prop in properties.items() if not name.endswith("_ids") and name != "answer_found"}
+    params["properties"] = {
+        "answer_found": properties["answer_found"],
+        "markdown": _DONE_MARKDOWN_PROPERTY,
+        **rest,
+        **ids,
+    }
+    # Every field required, the id lists included (empty when nothing is cited): held to a
+    # schema, a model skips what it may skip, and optional citations came back 0.5 a page
+    # against 11.5 required.
+    params["required"] = list(params["properties"])
     tool["function"]["description"] = (
-        "Signal completion with your final answer, as a structured document. Use this when you have "
+        "Signal completion with your final answer, as a markdown document. Use this when you have "
         "gathered enough information to answer the question." + _DONE_SUFFICIENCY_GATE
     )
     return tool
-
-
-TOOL_DONE_DOCUMENT = _done_tool_for_document(TOOL_DONE_ANSWER)
 
 
 def _done_tool_for_output_language(base: dict, language: str) -> dict:
@@ -375,15 +364,42 @@ def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
                         "items": {"type": "string"},
                         "description": "Array of observation IDs that support your answer",
                     },
+                    "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
                     "directive_compliance": {
                         "type": "string",
                         "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
                     },
                 },
-                "required": ["answer", "directive_compliance"],
+                "required": ["answer", "answer_found", "directive_compliance"],
             },
         },
     }
+
+
+#: ``_DONE_SUFFICIENCY_GATE`` for the tool that decides to stop when that is answer_ready.
+_READY_SUFFICIENCY_GATE = _DONE_SUFFICIENCY_GATE.replace("call done", "call answer_ready")
+
+#: The stop signal for reflects whose answer is written by the closing step: a turn that
+#: wrote the answer itself (as prose or as ``done``) was thrown away and written again
+#: there, so the model's last free turn cost as much as the answer (#5832).
+TOOL_ANSWER_READY = {
+    "type": "function",
+    "function": {
+        "name": "answer_ready",
+        # The sufficiency gate moves here with the stop decision: done is only called once asked.
+        "description": (
+            "Call this when what you retrieved is enough to answer. You will then be asked for the answer "
+            "through done. Do not write the answer before you are asked for it." + _READY_SUFFICIENCY_GATE
+        ),
+        # The one argument is done's own verdict, so the "nothing is known needs recall first"
+        # gate (#4567) still sees it: the answer itself is only written in the closing step.
+        "parameters": {
+            "type": "object",
+            "properties": {"answer_found": _DONE_ANSWER_FOUND_PROPERTY},
+            "required": ["answer_found"],
+        },
+    },
+}
 
 
 def get_reflect_tools(
@@ -394,6 +410,7 @@ def get_reflect_tools(
     include_expand: bool = True,
     answer_as_document: bool = False,
     llm_output_language: str | None = None,
+    answer_ready: bool = False,
 ) -> list[dict]:
     """
     Get the list of tools for the reflect agent.
@@ -418,6 +435,8 @@ def get_reflect_tools(
             markdown that gets persisted.
         llm_output_language: Configured output language. Swaps ``done``'s default
             answer-in-the-question's-language rule for a directive to write in it.
+        answer_ready: Offer ``answer_ready``, the stop signal (one ``answer_found``
+            bool), for a reflect whose answer the closing step writes.
 
     Returns:
         List of tool definitions in OpenAI format
@@ -435,6 +454,8 @@ def get_reflect_tools(
 
     if include_expand:
         tools.append(TOOL_EXPAND)
+    if answer_ready:
+        tools.append(TOOL_ANSWER_READY)
 
     # Use directive-aware done tool if directives are present
     if directive_rules:
@@ -442,8 +463,20 @@ def get_reflect_tools(
     else:
         done_tool = TOOL_DONE_ANSWER
     if answer_as_document:
-        done_tool = _done_tool_for_document(done_tool)
-    # After the document swap: that replaces the tool description this appends to.
+        done_tool = _done_tool_for_markdown_document(done_tool)
+    if answer_ready:
+        done_tool = copy.deepcopy(done_tool)
+        form = ""
+        if answer_as_document:
+            form = ", as a markdown document"
+        # Keeps the sufficiency gate: dropping it with the rest of the old description let the
+        # closing answer infer a value the evidence did not state (system eval hq-absent-2024).
+        done_tool["function"]["description"] = (
+            f"Your final answer{form}. Call this only when "
+            "you are asked for the answer; until then, call "
+            "answer_ready once you have enough." + _DONE_SUFFICIENCY_GATE
+        )
+    # After the document and answer_ready swaps: those replace the description this appends to.
     if llm_output_language:
         done_tool = _done_tool_for_output_language(done_tool, llm_output_language)
     tools.append(done_tool)

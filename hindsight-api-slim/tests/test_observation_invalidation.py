@@ -19,7 +19,8 @@ import pytest
 from hindsight_api import RequestContext
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memories import FactRecord, get_memories
-from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.schema import fq_table
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -127,7 +128,9 @@ async def _get_observation_ids(conn, bank_id: str) -> list[str]:
 
 
 async def _get_consolidated_at(conn, memory_id: uuid.UUID, bank_id: str | None = None):
-    """A memory's consolidated marker. ``bank_id`` is required for a bank-partitioned store."""
+    """A memory's consolidated marker. ``bank_id`` is required for a bank-partitioned store.
+
+    Read directly because the marker is scheduler state the public read API does not expose."""
     store = get_memories()
     if not store.store_owned:
         return await conn.fetchval(
@@ -712,8 +715,8 @@ class TestClearObservationsForMemory:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_no_observations_returns_zero(self, memory: MemoryEngine, request_context: RequestContext):
-        """Returns 0 when the memory has no associated observations."""
+    async def test_no_observations_still_resets_memory(self, memory: MemoryEngine, request_context: RequestContext):
+        """With no observations to delete, the memory is still reset and re-consolidation queued (#5731)."""
         bank_id = f"test-clear-obs-noop-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
 
@@ -721,13 +724,38 @@ class TestClearObservationsForMemory:
         async with pool.acquire() as conn:
             m1 = await _insert_memory(memory, conn, bank_id, "Alice loves hiking.")
 
-        result = await memory.clear_observations_for_memory(bank_id, str(m1), request_context=request_context)
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as submit:
+            result = await memory.clear_observations_for_memory(bank_id, str(m1), request_context=request_context)
 
         assert result["deleted_count"] == 0
+        submit.assert_awaited_once()
 
         async with pool.acquire() as conn:
-            # Memory should still be consolidated (no observations were cleared)
-            assert await _get_consolidated_at(conn, m1, bank_id) is not None
+            assert await _get_consolidated_at(conn, m1, bank_id) is None
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_http_clear_with_no_observations_resets_memory(
+        self, memory: MemoryEngine, api_client, request_context: RequestContext
+    ):
+        """The documented route resets the memory even when it had no observations (#5731)."""
+        bank_id = f"test-clear-obs-http-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(memory, conn, bank_id, "Alice loves hiking.")
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as submit:
+            resp = await api_client.delete(f"/v1/default/banks/{bank_id}/memories/{m1}/observations")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted_count": 0}
+        submit.assert_awaited_once()
+
+        async with pool.acquire() as conn:
+            assert await _get_consolidated_at(conn, m1, bank_id) is None
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -966,22 +994,30 @@ class TestUpdateDocumentTagsObservationCleanup:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_update_tags_no_consolidation_when_no_observations(
+    async def test_update_tags_requeues_moved_memories_without_observations(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        """submit_async_consolidation is NOT called when no observations are invalidated."""
+        """A retag that moves a memory's scope requeues it and submits consolidation even when no
+        observation was built on it: it was consolidated under a scope it no longer writes to,
+        and has never been tried in the new one (#5309). This used to submit nothing."""
         bank_id = f"test-tag-update-nocons-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
 
         pool = await memory._get_pool()
         async with pool.acquire() as conn:
             doc_id = f"doc-{uuid.uuid4().hex[:8]}"
-            await _insert_document_with_memories(memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")])
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
             # No observations inserted
 
         with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
             await memory.update_document(doc_id, bank_id, tags=["new-tag"], request_context=request_context)
-            mock_consolidate.assert_not_awaited()
+            mock_consolidate.assert_awaited_once()
+
+        async with pool.acquire() as conn:
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is None
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -1049,11 +1085,19 @@ class TestUpdateDocumentTagsObservationCleanup:
                 doc_id, bank_id, tags=["kind:handoff", "pickup"], request_context=request_context
             )
 
-        # Rebuild the observation the way consolidation would have, then re-send the
-        # SAME tags.
+        # Rebuild the observation the way consolidation would have — including marking the
+        # document's memories consolidated again, which the first PATCH requeued — then re-send
+        # the SAME tags.
         async with pool.acquire() as conn:
             obs_id = await _insert_observation(
                 memory, conn, bank_id, "Alice loves outdoor activities.", doc_mem_ids + [other_mem]
+            )
+            await get_memories().mark_consolidated(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_ids=[str(m) for m in doc_mem_ids],
+                when=datetime.now(timezone.utc),
             )
             assert await _get_consolidated_at(conn, other_mem, bank_id) is not None
 
@@ -1391,8 +1435,8 @@ class TestConsolidationSourceMemoryFiltering:
     async def test_update_observation_skipped_when_all_new_sources_deleted(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        from tests.consolidation_actions import execute_update_action as _execute_update_action
         from hindsight_api.engine.response_models import MemoryFact
+        from tests.consolidation_actions import execute_update_action as _execute_update_action
 
         bank_id = f"test-race-update-skip-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -1440,8 +1484,8 @@ class TestConsolidationSourceMemoryFiltering:
         # The preflight sees the source live, but it is deleted while the embedder runs
         # off-connection. The authoritative in-txn FOR SHARE liveness guard (not the preflight) must
         # then skip the update, so a dead source is never written back into the observation.
-        from tests.consolidation_actions import execute_update_action as _execute_update_action
         from hindsight_api.engine.response_models import MemoryFact
+        from tests.consolidation_actions import execute_update_action as _execute_update_action
 
         bank_id = f"test-race-update-inflight-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -1543,3 +1587,62 @@ class TestRetagDuringConsolidation:
         assert [o["id"] for o in done["items"]] == [str(mem_id)]
 
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+# ---------------------------------------------------------------------------
+# Tests: repair-bank's orphan observation sweep (#5937)
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanObservationRepair:
+    @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
+    async def test_sweep_removes_observations_citing_a_missing_source(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """An observation left behind by a delete that skipped the sweep goes, whether all or
+        only some of its sources are missing; its surviving sources are requeued, and an
+        observation whose sources all exist is left alone. A dry run only counts."""
+        from hindsight_api.engine.memories import sql_memories
+
+        bank_id = f"test-orphan-obs-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+        pool = await memory._get_pool()
+        store = sql_memories()
+        try:
+            async with pool.acquire() as conn:
+                kept_src = await _insert_memory(memory, conn, bank_id, "Bob plays chess.")
+                survivor = await _insert_memory(memory, conn, bank_id, "Alice loves hiking.")
+                leaked = await _insert_memory(memory, conn, bank_id, "Alice hikes every weekend.")
+                healthy = await _insert_observation(memory, conn, bank_id, "Bob plays chess.", [kept_src])
+                some_gone = await _insert_observation(memory, conn, bank_id, "Alice hikes.", [survivor, leaked])
+                all_gone = await _insert_observation(memory, conn, bank_id, "Carol swims.", [uuid.uuid4()])
+                # The leak: a fact removed without the observation sweep.
+                await conn.execute("DELETE FROM memory_units WHERE id = $1", leaked)
+
+                assert (
+                    await store.admin_sweep_orphan_observations(
+                        conn=conn, schema="public", bank_id=bank_id, dry_run=True
+                    )
+                    == 2
+                )
+                assert len(await _get_observation_ids(conn, bank_id)) == 3
+
+                removed = await store.admin_sweep_orphan_observations(
+                    conn=conn, schema="public", bank_id=bank_id, dry_run=False
+                )
+
+                assert removed == 2
+                remaining = await _get_observation_ids(conn, bank_id)
+                assert str(healthy) in remaining
+                assert str(some_gone) not in remaining and str(all_gone) not in remaining
+                assert await _get_consolidated_at(conn, survivor) is None
+                assert await _get_consolidated_at(conn, kept_src) is not None
+                assert (
+                    await store.admin_sweep_orphan_observations(
+                        conn=conn, schema="public", bank_id=bank_id, dry_run=False
+                    )
+                    == 0
+                )
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)

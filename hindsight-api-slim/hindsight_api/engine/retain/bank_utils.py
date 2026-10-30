@@ -16,9 +16,10 @@ from pydantic import BaseModel, Field
 
 from ..._vector_index import index_using_clause, per_bank_indexes_are_eager, uses_per_bank_vector_indexes
 from ...config import get_config
+from ...schema_context import get_current_schema
 from ..db_utils import acquire_with_retry, retry_with_backoff
-from ..memory_engine import fq_table, get_current_schema
 from ..response_models import DispositionTraits
+from ..schema import fq_table
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -350,6 +351,10 @@ def validate_new_bank_id(bank_id: str) -> None:
         )
     if any(unicodedata.category(ch) == "Cc" for ch in bank_id):
         raise OperationValidationError("Bank id must not contain control characters", status_code=400)
+    # Reserved so a store-owned backend can keep its own bookkeeping objects (`_index`, `_meta`, ...)
+    # next to a bank's objects without escaping bank names. Existing banks are not re-checked.
+    if bank_id.startswith("_"):
+        raise OperationValidationError("Bank id must not start with '_': that prefix is reserved", status_code=400)
 
 
 async def create_bank_row_on_conn(conn: "DatabaseConnection", bank_id: str, *, ops: "DataAccessOps") -> bool:

@@ -45,14 +45,11 @@ from hindsight_api.engine.cache_affinity import (
     resolve_cache_affinity,
 )
 from hindsight_api.engine.llm_interface import (
-    LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
-    LLMToolChoice,
-    LLMToolChoiceMode,
     OutputTooLongError,
     ProviderRateLimitResetError,
 )
-from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_trace import LLMResponseUsage, current_response_usage, stash_response_usage
 from hindsight_api.engine.llm_transport import (
     build_aiohttp_timeout,
     build_sdk_timeout,
@@ -61,7 +58,8 @@ from hindsight_api.engine.llm_transport import (
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.providers.openai_compatible_headers import with_openai_compatible_user_agent
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.remote_retry import jittered_backoff
+from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
@@ -86,19 +84,6 @@ def _validate_ollama_num_ctx(value: Any) -> int | None:
         raise ValueError(f"ollama_num_ctx must be >= 1, got {value}")
     return value
 
-
-# Provider implementations that advertise tool_choice="required"
-# but silently ignore it: instead of forcing a tool call they return
-# finish_reason "stop"/"tool_calls" with an EMPTY tool_calls array and no error.
-# Reflect's agent loop then sees no tool call, runs synthesis with no retrieval,
-# and answers "I don't have information" even when the bank holds the answer.
-# See issues #1563 (LM Studio), #1179 (LM Studio + Qwen), #1877 (vLLM with
-# --enable-auto-tool-choice). The generic OpenAI provider is intentionally not
-# inferred from its URL: custom OpenAI-compatible endpoints can implement the
-# required-tool contract, and silently downgrading them changes request semantics.
-# llama-server (the "llamacpp" provider) honors "required" correctly and is
-# intentionally excluded (#1179).
-_TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS = frozenset({"lmstudio", "ollama"})
 
 # Local providers whose OpenAI-compatible surface always lives under a `/v1`
 # path (LM Studio: http://localhost:1234/v1, Ollama: http://localhost:11434/v1).
@@ -128,9 +113,11 @@ def _ensure_v1_base_url(base_url: str) -> str:
 class ProviderResponseError(RuntimeError):
     """Raised when a provider returns a success response without usable content."""
 
-    def __init__(self, message: str, *, retryable: bool = True):
+    def __init__(self, message: str, *, retryable: bool = True, served_by: str | None = None):
         super().__init__(message)
         self.retryable = retryable
+        # The upstream a gateway routed the call to (OpenRouter's response "provider").
+        self.served_by = served_by
 
 
 def _is_json(text: str) -> bool:
@@ -341,6 +328,31 @@ def _message_refusal(message: Any) -> Any:
     return _response_get(message, "refusal")
 
 
+def _served_by(response: Any) -> str | None:
+    """The upstream a gateway such as OpenRouter served the call from, when it says."""
+    served_by = _response_get(response, "provider")
+    return served_by if isinstance(served_by, str) else None
+
+
+def _raise_if_generation_failed(response: Any, choice: Any, *, provider: str, model: str, scope: str) -> None:
+    # OpenRouter reports an upstream that died mid-generation as HTTP 200 with
+    # finish_reason="error" and the cause on the choice. That is a transport failure,
+    # not an answer: whatever content or tool calls it carries are partial, so it is
+    # retried like a 5xx instead of being read as "the model chose nothing" (#5612).
+    # LiteLLM rewrites this finish_reason to "stop" and keeps the original, and the
+    # error, under the choice's provider_specific_fields.
+    litellm_fields = _response_get(choice, "provider_specific_fields") or {}
+    if _finish_reason_for_choice(choice) == "error" or litellm_fields.get("native_finish_reason") == "error":
+        served_by = _served_by(response)
+        raise ProviderResponseError(
+            f"Provider ended generation with an error ({provider}/{model}, scope={scope}, "
+            f"finish_reason=error, served_by={served_by}): "
+            f"{_summarize_provider_error_payload(_response_get(choice, 'error') or litellm_fields.get('error'))}",
+            retryable=True,
+            served_by=served_by,
+        )
+
+
 def _first_choice_or_error(response: Any, *, provider: str, model: str, scope: str) -> Any:
     """Return the first choice or raise a clear error for malformed success responses."""
 
@@ -359,7 +371,55 @@ def _first_choice_or_error(response: Any, *, provider: str, model: str, scope: s
             f"Provider returned no choices ({provider}/{model}, scope={scope})",
             retryable=True,
         )
-    return choices[0]
+    choice = choices[0]
+    _raise_if_generation_failed(response, choice, provider=provider, model=model, scope=scope)
+    return choice
+
+
+def record_retried_attempt(
+    *,
+    provider: str,
+    model: str,
+    scope: str,
+    messages: list[dict[str, Any]],
+    error: ProviderResponseError,
+    started: float,
+) -> None:
+    """Trace an attempt that came back unusable and is about to be retried.
+
+    The final failure is traced by the wrapper, but a retried attempt otherwise leaves
+    only a log line: it was still billed (often for reasoning tokens), and counting
+    these per upstream is how a flaky gateway route is found (#5612).
+    """
+    from hindsight_api.tracing import get_span_recorder
+
+    usage = current_response_usage()
+    duration = time.perf_counter() - started
+    get_metrics_collector().record_llm_call(
+        provider=provider,
+        model=model,
+        scope=scope,
+        duration=duration,
+        input_tokens=usage.input_tokens if usage else 0,
+        output_tokens=usage.output_tokens if usage else 0,
+        success=False,
+        cached_input_tokens=usage.cached_tokens if usage else 0,
+        thoughts_tokens=usage.thoughts_tokens if usage else 0,
+    )
+    get_span_recorder().record_llm_call(
+        provider=provider,
+        model=model,
+        scope=scope,
+        messages=messages,
+        response_content=None,
+        input_tokens=usage.input_tokens if usage else 0,
+        output_tokens=usage.output_tokens if usage else 0,
+        cached_tokens=usage.cached_tokens if usage else 0,
+        thoughts_tokens=usage.thoughts_tokens if usage else 0,
+        duration=duration,
+        error=error,
+        served_by=error.served_by,
+    )
 
 
 def _is_openrouter(provider: str, base_url: str | None) -> bool:
@@ -507,20 +567,6 @@ def _ensure_json_word_in_user_message(messages: list[dict[str, Any]]) -> list[di
     return normalized
 
 
-# Provider implementations that reject every tool_choice except "auto" with an
-# HTTP 400 rather than ignoring it. Meta Model API: 'only `"auto"` is supported
-# for `tool_choice`. `"none"`, `"required"`, and named function choices are not
-# currently supported'. Reflect's agent loop forces a retrieval tool on its first
-# turn, so without this every reflect call against Meta fails outright.
-# Z.AI answers the same way: 'Tool choice must be auto' (#4246).
-_NON_AUTO_TOOL_CHOICE_UNSUPPORTED_PROVIDERS = frozenset({"meta", "zai"})
-
-# Vendor namespaces a gateway puts in front of the model id when it routes to one
-# of those endpoints. The gateway is the provider, so the set above cannot see
-# them: OpenRouter serves Z.AI as "z-ai/glm-5.3-flash".
-_NON_AUTO_TOOL_CHOICE_UNSUPPORTED_MODEL_VENDORS = frozenset({"z-ai", "zai"})
-
-
 def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
     """Render an APIStatusError with status code + truncated response body.
 
@@ -571,39 +617,6 @@ _RATE_LIMIT_WINDOW_RE = re.compile(
 # on (a naive single-component match would silently read "6m0s" as "0s").
 _GO_DURATION_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h|d)")
 _GO_DURATION_UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
-
-
-def _asks_for_reasoning_effort_none(e: APIStatusError) -> bool:
-    """Whether OpenAI rejected function tools and named ``reasoning_effort="none"`` as the fix.
-
-    Some OpenAI reasoning models refuse function tools on /v1/chat/completions at
-    any effort level *including an absent one* -- verified for gpt-5.6-terra and
-    gpt-6-luna (#4891):
-
-        Function tools with reasoning_effort are not supported for gpt-6-luna in
-        /v1/chat/completions. To use function tools, use /v1/responses or set
-        reasoning_effort to 'none'.
-
-    The error carries its own remedy, so match on that rather than on a model name:
-    the set of affected models is OpenAI's to grow, and reflect (a tool-calling
-    loop) otherwise fails outright until the operator discovers the setting.
-    """
-    # The remedy lives in the response body, not in the exception's own message.
-    message = _summarize_status_error(e, body_max=1000)
-    return "reasoning_effort" in message and "'none'" in message
-
-
-def _rejects_tool_choice(e: APIStatusError) -> bool:
-    """Whether the endpoint refused the request because of its ``tool_choice``.
-
-    The static lists above cover endpoints that always refuse a forced choice. Some
-    refuse it only in one mode, so no model name can tell: Alibaba's Qwen 3.8 host
-    (direct or through OpenRouter) answers "The tool_choice parameter does not
-    support being set to required or object in thinking mode", while vLLM and Groq
-    serve the same weights and accept it. Reflect forces its first retrieval call,
-    so without this every reflect against that host failed on its first request.
-    """
-    return e.status_code == 400 and "tool_choice" in _summarize_status_error(e, body_max=1000)
 
 
 def _parse_go_duration_seconds(text: str) -> float | None:
@@ -837,9 +850,7 @@ class OpenAICompatibleLLM(LLMInterface):
             base_url: Base URL for the API (uses defaults for groq/ollama/lmstudio if empty).
             model: Model name.
             reasoning_effort: Reasoning effort level for supported models
-                ("none", "low", "medium", "high"). "none" is required when calling
-                function tools on some reasoning models, which reject every other
-                value — including omitting the parameter entirely.
+                ("none", "low", "medium", "high").
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
@@ -1011,35 +1022,6 @@ class OpenAICompatibleLLM(LLMInterface):
             f"mode={self._cache_affinity.value}"
         )
 
-    def _drops_tool_choice_required(self) -> bool:
-        """Whether this endpoint silently ignores ``tool_choice="required"``.
-
-        Only explicitly identified provider implementations are classified as
-        unsupported. A custom base URL does not identify endpoint capabilities:
-        an OpenAI-compatible endpoint may correctly enforce required tool calls,
-        and replacing ``required`` with ``auto`` would violate the caller's named
-        tool choice after the tools list has been narrowed.
-        """
-        return self.provider in _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS
-
-    def _rejects_non_auto_tool_choice(self) -> bool:
-        """Whether this endpoint rejects every ``tool_choice`` except ``"auto"``.
-
-        Distinct from ``_drops_tool_choice_required``: those endpoints accept the
-        field and quietly ignore it, so reflect gets a useless answer. These
-        endpoints fail the request outright with HTTP 400, so reflect gets no
-        answer at all. Meta Model API is the first of them — it rejects "none",
-        "required" and named choices alike.
-
-        A gateway reports itself as the provider, so the same endpoint reached
-        through one is identified by the vendor namespace of the model id. The
-        bare model name is not matched: it names the weights, not the endpoint.
-        """
-        if self.provider in _NON_AUTO_TOOL_CHOICE_UNSUPPORTED_PROVIDERS:
-            return True
-        namespaces = self.model.lower().split("/")[:-1]
-        return any(ns in _NON_AUTO_TOOL_CHOICE_UNSUPPORTED_MODEL_VENDORS for ns in namespaces)
-
     def _verification_max_completion_tokens(self) -> int:
         """Return the startup verification budget for OpenAI-compatible gateways."""
         return DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS
@@ -1157,7 +1139,9 @@ class OpenAICompatibleLLM(LLMInterface):
     def _apply_provider_extra_body_defaults(self, extra_body: dict[str, Any]) -> None:
         """Apply provider-specific extra_body defaults while preserving user overrides."""
         if self.provider == "minimax":
-            extra_body.setdefault("thinking", {"type": "disabled"})
+            # M3.1 always thinks: ``thinking.type="disabled"`` is an HTTP 400 there (#5718).
+            thinking = "adaptive" if "m3.1" in self.model.lower() else "disabled"
+            extra_body.setdefault("thinking", {"type": thinking})
 
     async def call(
         self,
@@ -1221,7 +1205,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 attempt_context=attempt_context,
             )
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Build call parameters
         call_params: dict[str, Any] = {
@@ -1254,6 +1238,11 @@ class OpenAICompatibleLLM(LLMInterface):
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
         self._apply_provider_extra_body_defaults(extra_body)
+        # OpenAI takes service_tier as a native top-level param; other servers on this
+        # class (lmstudio, ollama, ...) don't know it, and Groq sends its own tier via
+        # extra_body below. This path used to drop the tier entirely (#5439).
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
             # Add service_tier if configured
@@ -1267,6 +1256,8 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Prepare response format ONCE before retry loop
         if response_format is not None:
+            # A backend without json_schema takes the schema in the prompt instead.
+            strict_schema = strict_schema and self._supports_strict_schema()
             schema = None
             if hasattr(response_format, "model_json_schema"):
                 schema = strict_json_schema(response_format) if strict_schema else provider_json_schema(response_format)
@@ -1332,7 +1323,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         # on every byte, so an upstream trickling keep-alive whitespace never trips it
                         # and the call pins its worker slot forever (#4763).
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     # Stash usage before parse/validate, which may raise locally
                     # even though the provider charged for these tokens (#2387).
@@ -1414,7 +1405,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     async with attempt_context() if attempt_context is not None else nullcontext():
                         set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     stash_response_usage(_usage_from_openai_response(response))
                     result, first_choice = _content_or_error(
@@ -1432,7 +1423,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     result = _strip_reasoning_tags(result)
 
                 # Record token usage metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 usage = response.usage
                 # ``output_tokens``/``total_tokens`` are visible-only past this
                 # point, with reasoning surfaced separately in
@@ -1478,6 +1469,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     error=None,
                     cached_tokens=cached_tokens,
                     thoughts_tokens=thoughts_tokens,
+                    served_by=_served_by(response),
                 )
 
                 # Log slow calls
@@ -1549,7 +1541,7 @@ class OpenAICompatibleLLM(LLMInterface):
                                         result = response_format.model_validate(converted)
 
                                     # Record metrics
-                                    duration = time.time() - start_time
+                                    duration = time.perf_counter() - start_time
                                     metrics = get_metrics_collector()
                                     metrics.record_llm_call(
                                         provider=self.provider,
@@ -1560,6 +1552,25 @@ class OpenAICompatibleLLM(LLMInterface):
                                         output_tokens=0,
                                         success=True,
                                     )
+                                    # A recovered call is a successful one: the wrapper
+                                    # will not trace it, so record the span here (#5381).
+                                    try:
+                                        from hindsight_api.tracing import _serialize_for_span, get_span_recorder
+
+                                        get_span_recorder().record_llm_call(
+                                            provider=self.provider,
+                                            model=self.model,
+                                            scope=scope,
+                                            messages=messages,
+                                            response_content=_serialize_for_span(result),
+                                            input_tokens=0,
+                                            output_tokens=0,
+                                            duration=duration,
+                                            finish_reason=None,
+                                            error=None,
+                                        )
+                                    except Exception:
+                                        logger.debug("Span recording failed", exc_info=True)
                                     return LLMCallResult(
                                         content=result,
                                         usage=TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0),
@@ -1573,10 +1584,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    sleep_time = backoff + jitter
-                    await asyncio.sleep(sleep_time)
+                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                 else:
                     logger.error(
                         f"API error after {max_retries + 1} attempts ({self.provider}/{self.model}, "
@@ -1586,6 +1594,14 @@ class OpenAICompatibleLLM(LLMInterface):
             except ProviderResponseError as e:
                 last_exception = e
                 if e.retryable and attempt < max_retries:
+                    record_retried_attempt(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        error=e,
+                        started=start_time,
+                    )
                     logger.warning(
                         f"Provider response error ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): {e}"
@@ -1605,304 +1621,6 @@ class OpenAICompatibleLLM(LLMInterface):
         if last_exception:
             raise last_exception
         raise RuntimeError("LLM call failed after all retries with no exception captured")
-
-    async def call_with_tools(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        max_completion_tokens: int | None = None,
-        temperature: float | None = None,
-        scope: str = "tools",
-        max_retries: int = 5,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> LLMToolCallResult:
-        """
-        Make an LLM API call with tool/function calling support.
-
-        Args:
-            messages: List of message dicts. Can include tool results with role='tool'.
-            tools: List of tool definitions in OpenAI format.
-            max_completion_tokens: Maximum tokens in response.
-            temperature: Sampling temperature (0.0-2.0).
-            scope: Scope identifier for tracking.
-            max_retries: Maximum retry attempts.
-            initial_backoff: Initial backoff time in seconds.
-            max_backoff: Maximum backoff time in seconds.
-            tool_choice: Canonical tool-selection policy.
-
-        Returns:
-            LLMToolCallResult with content and/or tool_calls.
-        """
-        start_time = time.time()
-
-        request_tool_choice: str | None
-        if tool_choice.mode is LLMToolChoiceMode.NAMED:
-            forced_name = tool_choice.selected_function_name
-            filtered = [tool for tool in tools if tool.get("function", {}).get("name") == forced_name]
-            if len(filtered) != 1:
-                raise ValueError(
-                    f"Named tool_choice must reference exactly one declared tool; "
-                    f"found {len(filtered)} definitions for {forced_name!r}"
-                )
-            tools = filtered
-            request_tool_choice = LLMToolChoiceMode.REQUIRED.value
-        elif tool_choice.mode is LLMToolChoiceMode.AUTO:
-            request_tool_choice = None
-        else:
-            request_tool_choice = tool_choice.mode.value
-
-        # DeepSeek accepts tool calls but rejects explicit required/named
-        # tool_choice values. The tools list has already been narrowed for
-        # forced calls, so omitting tool_choice preserves the practical behavior.
-        if "deepseek" in self.model.lower() and tool_choice.mode is not LLMToolChoiceMode.AUTO:
-            request_tool_choice = None
-
-        # Meta and Z.AI (direct or via a gateway) reject any tool_choice other than
-        # "auto" outright (HTTP 400), so the field has to come off the request entirely. A named choice has already been
-        # narrowed to a single tool above, so the call stays practically forced under
-        # auto — the same reasoning as the DeepSeek branch. NOTE: "none" cannot be
-        # expressed this way and would become "auto"; no caller on this path uses it
-        # (only the gemini / claude-code / cursor / github-copilot providers handle NONE), so
-        # it is left rather than given an untested tools-stripping branch.
-        if self._rejects_non_auto_tool_choice() and tool_choice.mode is not LLMToolChoiceMode.AUTO:
-            request_tool_choice = None
-
-        # LM Studio and Ollama silently drop tool_choice="required", returning an
-        # empty tool_calls array instead of forcing a call (#1563/#1179).
-        # Downgrade to auto (None) so the model still gets to call a tool. Named
-        # tool_choice dicts were already normalized to "required" + a single
-        # filtered tool above, so the call stays practically forced even under
-        # auto. Generic OpenAI-compatible endpoints retain the canonical
-        # ``required`` contract regardless of whether they use a custom base URL.
-        if request_tool_choice == LLMToolChoiceMode.REQUIRED.value and self._drops_tool_choice_required():
-            request_tool_choice = None
-
-        # DeepSeek tool-call replies can carry provider-specific reasoning_content.
-        # The normalized tool result does not retain it, but replaying assistant
-        # tool_calls without the field can trigger a 400. DeepSeek accepts an
-        # empty-string fallback, matching the provider's history-replay contract.
-        if "deepseek" in self.model.lower():
-            normalized_messages: list[dict[str, Any]] = []
-            for msg in messages:
-                if msg.get("role") == "assistant" and msg.get("tool_calls") and "reasoning_content" not in msg:
-                    normalized_msg = dict(msg)
-                    normalized_msg["reasoning_content"] = ""
-                    normalized_messages.append(normalized_msg)
-                else:
-                    normalized_messages.append(msg)
-            messages = normalized_messages
-
-        # Build call parameters
-        call_params: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-        }
-        if request_tool_choice is not None:
-            call_params["tool_choice"] = request_tool_choice
-
-        if max_completion_tokens is not None:
-            call_params[self._max_tokens_param_name()] = max_completion_tokens
-        if temperature is not None and not self._supports_reasoning_model():
-            # MiniMax requires temperature in (0.0, 1.0] — clamp accordingly
-            if self.provider == "minimax":
-                temperature = max(0.01, min(temperature, 1.0))
-            call_params["temperature"] = temperature
-
-        # Set reasoning_effort for reasoning models, matching call(). Omitting it
-        # here is not a neutral default: OpenAI rejects function tools on a
-        # reasoning model unless reasoning_effort is present and set to "none",
-        # so leaving it out fails exactly like sending an unsupported value.
-        if self._sends_reasoning_effort():
-            call_params["reasoning_effort"] = self.reasoning_effort
-
-        # Provider-specific parameters. Note for Ollama: unlike call(), this path
-        # has no native /api/chat equivalent here, so a configured ollama_num_ctx
-        # cannot reach the server — the OpenAI-compatible endpoint has no field for
-        # it and sending one under "options" is silently dropped (issue #3599).
-        # Porting tool calls to the native API means translating the tool-call
-        # request and response shapes both ways, so it is deliberately not done.
-        extra_body: dict[str, Any] = {**self._config_extra_body}
-        self._apply_provider_extra_body_defaults(extra_body)
-        if self.provider == "groq":
-            call_params["seed"] = DEFAULT_LLM_SEED
-        if extra_body:
-            call_params["extra_body"] = extra_body
-
-        apply_bank_attribution(call_params)
-        apply_cache_affinity(call_params, self._cache_affinity)
-        apply_opencode_session(call_params, base_url=self.base_url)
-
-        last_exception = None
-
-        # Mutable budget rather than a fixed range: the reasoning_effort repair below
-        # grants one extra attempt, since it changes the request instead of retrying it.
-        attempts_allowed = max_retries + 1
-        attempt = -1
-        while (attempt := attempt + 1) < attempts_allowed:
-            try:
-                async with attempt_context() if attempt_context is not None else nullcontext():
-                    set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{attempts_allowed}")
-                    response = await asyncio.wait_for(
-                        self._client.chat.completions.create(**call_params), timeout=self.timeout
-                    )
-                    stash_response_usage(_usage_from_openai_response(response))
-
-                message = response.choices[0].message
-                finish_reason = response.choices[0].finish_reason
-
-                # Extract tool calls if present
-                tool_calls: list[LLMToolCall] = []
-                if message.tool_calls:
-                    for tc in message.tool_calls:
-                        try:
-                            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                        except json.JSONDecodeError:
-                            args = {"_raw": tc.function.arguments}
-                        tool_calls.append(LLMToolCall(id=tc.id, name=tc.function.name, arguments=args))
-
-                content = message.content
-
-                # Record metrics
-                duration = time.time() - start_time
-                # See ``visible_token_usage``: ``output_tokens`` is visible-only,
-                # with reasoning surfaced separately in ``thoughts_tokens``.
-                token_counts = visible_token_usage(response)
-                input_tokens = token_counts.input_tokens
-                output_tokens = token_counts.output_tokens
-                cached_tokens = token_counts.cached_tokens
-                thoughts_tokens = token_counts.thoughts_tokens
-
-                # See ``call()``: record the reasoning and cached counts too, so no
-                # billed token is dropped from the metrics counters.
-                metrics = get_metrics_collector()
-                metrics.record_llm_call(
-                    provider=self.provider,
-                    model=self.model,
-                    scope=scope,
-                    duration=duration,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    success=True,
-                    cached_input_tokens=cached_tokens,
-                    thoughts_tokens=thoughts_tokens,
-                )
-
-                # Record OpenTelemetry span
-                from hindsight_api.tracing import get_span_recorder
-
-                span_recorder = get_span_recorder()
-                # Convert LLMToolCall objects to dicts for span recording
-                tool_calls_dict = (
-                    [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls]
-                    if tool_calls
-                    else None
-                )
-                span_recorder.record_llm_call(
-                    provider=self.provider,
-                    model=self.model,
-                    scope=scope,
-                    messages=messages,
-                    response_content=content,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    duration=duration,
-                    finish_reason=finish_reason,
-                    error=None,
-                    tool_calls=tool_calls_dict,
-                    cached_tokens=cached_tokens,
-                    thoughts_tokens=thoughts_tokens,
-                )
-
-                return LLMToolCallResult(
-                    content=content,
-                    tool_calls=tool_calls,
-                    finish_reason=finish_reason,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cached_tokens=cached_tokens,
-                    thoughts_tokens=thoughts_tokens,
-                )
-
-            except (APIConnectionError, TimeoutError) as e:
-                last_exception = e
-                status_code = getattr(e, "status_code", None) or getattr(
-                    getattr(e, "response", None), "status_code", None
-                )
-                if attempt + 1 < attempts_allowed:
-                    logger.warning(
-                        f"Connection error in tool call ({self.provider}/{self.model}, scope={scope}, "
-                        f"attempt {attempt + 1}/{attempts_allowed}, HTTP {status_code}): {describe_llm_error(e)}"
-                    )
-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
-                    continue
-                logger.error(
-                    f"Connection error in tool call after {attempts_allowed} attempts "
-                    f"({self.provider}/{self.model}, scope={scope}): {describe_llm_error(e)}"
-                )
-                raise
-
-            except APIStatusError as e:
-                if e.status_code in (401, 403):
-                    logger.error(
-                        f"Auth error in tool call (HTTP {e.status_code}, {self.provider}/{self.model}), "
-                        f"not retrying: {_summarize_status_error(e)}"
-                    )
-                    raise
-
-                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
-                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_params)
-
-                _raise_provider_quota_defer(
-                    e, provider=self.provider, model=self.model, scope=scope, max_backoff=max_backoff
-                )
-
-                last_exception = e
-
-                # Apply the remedy the API just named, once, and retry immediately
-                # (no backoff -- nothing is overloaded, the request shape was wrong).
-                if call_params.get("reasoning_effort") != "none" and _asks_for_reasoning_effort_none(e):
-                    logger.warning(
-                        f"{self.provider}/{self.model} rejects function tools unless reasoning_effort "
-                        f'is "none"; retrying with it (scope={scope}). Set '
-                        "HINDSIGHT_API_LLM_PROVIDER=openai-responses to keep reasoning on the tool path."
-                    )
-                    call_params["reasoning_effort"] = "none"
-                    attempts_allowed += 1
-                    continue
-                if "tool_choice" in call_params and _rejects_tool_choice(e):
-                    # Same downgrade as the static Meta/Z.AI branch above: a named
-                    # choice was already narrowed to its one tool, so "auto" keeps
-                    # the call practically forced.
-                    logger.warning(
-                        f"{self.provider}/{self.model} rejected tool_choice={call_params['tool_choice']!r}; "
-                        f"retrying with auto (scope={scope}): {_summarize_status_error(e)}"
-                    )
-                    del call_params["tool_choice"]
-                    attempts_allowed += 1
-                    continue
-
-                if attempt + 1 < attempts_allowed:
-                    logger.warning(
-                        f"APIStatusError in tool call ({self.provider}/{self.model}, scope={scope}, "
-                        f"attempt {attempt + 1}/{attempts_allowed}): {_summarize_status_error(e)}"
-                    )
-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
-                    continue
-                logger.error(
-                    f"API error in tool call after {attempts_allowed} attempts "
-                    f"({self.provider}/{self.model}, scope={scope}): {_summarize_status_error(e)}"
-                )
-                raise
-            except Exception:
-                raise
-
-        if last_exception:
-            raise last_exception
-        raise RuntimeError("Tool call failed after all retries")
 
     async def _call_ollama_native(
         self,
@@ -1926,7 +1644,7 @@ class OpenAICompatibleLLM(LLMInterface):
         message text, so free-form calls can reach the one endpoint that honours
         ``options.num_ctx``.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Get the JSON schema from the Pydantic model
         schema = provider_json_schema(response_format) if hasattr(response_format, "model_json_schema") else None
@@ -2085,7 +1803,7 @@ class OpenAICompatibleLLM(LLMInterface):
                                 raise
 
                 # Extract token usage from Ollama response
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 input_tokens = result.get("prompt_eval_count", 0) or 0
                 output_tokens = result.get("eval_count", 0) or 0
                 total_tokens = input_tokens + output_tokens
@@ -2138,6 +1856,14 @@ class OpenAICompatibleLLM(LLMInterface):
             except ProviderResponseError as e:
                 last_exception = e
                 if e.retryable and attempt < max_retries:
+                    record_retried_attempt(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        error=e,
+                        started=start_time,
+                    )
                     logger.warning(f"Ollama response error (attempt {attempt + 1}/{max_retries + 1}): {e}")
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
                     await asyncio.sleep(backoff)
@@ -2182,6 +1908,15 @@ class OpenAICompatibleLLM(LLMInterface):
             raise last_exception
         raise RuntimeError("Ollama call failed after all retries")
 
+    def _supports_strict_schema(self) -> bool:
+        """Whether the backend accepts a strict ``json_schema`` response_format.
+
+        DeepSeek answers it with HTTP 400 "This response_format type is unavailable now"
+        and takes only ``json_object``. Every reflect turn asks for a strict schema, so
+        sending it there failed every turn.
+        """
+        return self.provider != "deepseek"
+
     def _supports_json_mode(self) -> bool:
         """Whether to send ``json_object`` on the soft path, or the schema in the prompt only."""
         from hindsight_api.config import get_config
@@ -2191,8 +1926,11 @@ class OpenAICompatibleLLM(LLMInterface):
             return config.llm_openai_compatible_json_mode
         if self.provider == "llamacpp":
             return not config.llamacpp_no_grammar
-        # These don't honour json_object reliably.
-        return self.provider not in ("lmstudio", "ollama", "volcano")
+        # These don't honour json_object reliably. z.ai is worse than unreliable:
+        # in json_object mode it deletes the literal token "json" from the
+        # generated text, so `fleet --json` is stored as `fleet --` and
+        # `latest.json` as `latest.` — still valid JSON, silently corrupted (#5175).
+        return self.provider not in ("lmstudio", "ollama", "volcano", "zai")
 
     def supports_vision(self) -> bool | None:
         """Known only for OpenAI itself; unknown for every other backend here.
@@ -2350,6 +2088,17 @@ class OpenAICompatibleLLM(LLMInterface):
             await self._client.close()
         if hasattr(self, "_ollama_http"):
             await self._ollama_http.close()
+
+    def supports_request_overrides(self) -> bool:
+        # Ollama's structured/num_ctx calls take a native HTTP path outside the SDK client.
+        return self.provider != "ollama"
+
+    def _request_client(self) -> Any:
+        """The SDK client for one call, with the credentials an LLM request extension chose."""
+        # Lazy: importing the extensions package here would be circular.
+        from hindsight_api.extensions.llm_request import request_client
+
+        return request_client(self._client)
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

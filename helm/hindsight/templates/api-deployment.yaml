@@ -6,8 +6,15 @@ metadata:
   labels:
     {{- include "hindsight.api.labels" . | nindent 4 }}
 spec:
+  {{- with include "hindsight.revisionHistoryLimit" (dict "local" .Values.api.revisionHistoryLimit "root" .) }}
+  {{ . }}
+  {{- end }}
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  {{- with .Values.api.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
   selector:
     matchLabels:
@@ -27,6 +34,10 @@ spec:
       {{- if .Values.serviceAccount.create }}
       serviceAccountName: {{ include "hindsight.serviceAccountName" . }}
       {{- end }}
+      {{- if kindIs "bool" .Values.api.automountServiceAccountToken }}
+      automountServiceAccountToken: {{ .Values.api.automountServiceAccountToken }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.api.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.api.extraInitContainers }}
@@ -39,6 +50,10 @@ spec:
           {{- toYaml .Values.securityContext | nindent 10 }}
         image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Values.version | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+        {{- with .Values.api.command }}
+        command:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         ports:
         - name: http
           containerPort: {{ .Values.api.service.targetPort }}
@@ -92,6 +107,10 @@ spec:
               name: {{ include "hindsight.secretName" $ }}
               key: {{ $key }}
         {{- end }}
+        {{- end }}
+        {{- with .Values.api.startupProbe }}
+        startupProbe:
+          {{- toYaml . | nindent 10 }}
         {{- end }}
         livenessProbe:
           {{- toYaml .Values.api.livenessProbe | nindent 10 }}

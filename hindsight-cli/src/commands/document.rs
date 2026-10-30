@@ -234,6 +234,51 @@ pub fn get(
     }
 }
 
+pub fn history(
+    client: &ApiClient,
+    agent_id: &str,
+    document_id: &str,
+    limit: i32,
+    offset: i32,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let history = client.get_document_history(agent_id, document_id, limit, offset)?;
+    if output_format != OutputFormat::Pretty {
+        return output::print_output(&history, output_format);
+    }
+    ui::print_info(&format!(
+        "History of {} ({} operations, newest first)",
+        history.document_id, history.total
+    ));
+    // Optional in the schema (they default to empty), so absent reads as zero.
+    let count = |s: &Option<hindsight_client::types::ObservationIdSample>| {
+        s.as_ref().map_or(0, |s| s.count)
+    };
+    for e in &history.items {
+        let removed_ids = e
+            .observations_removed
+            .as_ref()
+            .map(|s| s.ids.join(", "))
+            .unwrap_or_default();
+        println!(
+            "  {}  {:<17} facts +{}/-{}  observations +{} ~{} -{}{}",
+            e.created_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            e.kind.to_string(),
+            e.facts_added,
+            e.facts_removed,
+            count(&e.observations_created),
+            count(&e.observations_updated),
+            count(&e.observations_removed),
+            if removed_ids.is_empty() {
+                String::new()
+            } else {
+                format!("  removed: {removed_ids}")
+            }
+        );
+    }
+    Ok(())
+}
+
 pub fn delete(
     client: &ApiClient,
     agent_id: &str,
@@ -270,18 +315,38 @@ pub fn delete(
     }
 }
 
-/// Update a document (currently only supports replacing tags)
+/// Parse `--observation-scopes`: a mode name, or a JSON list of tag lists.
+fn parse_observation_scopes(raw: &str) -> Result<serde_json::Value> {
+    match raw {
+        "per_tag" | "combined" | "all_combinations" | "shared" => Ok(serde_json::json!(raw)),
+        _ => serde_json::from_str::<Vec<Vec<String>>>(raw)
+            .map(|scopes| serde_json::json!(scopes))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "--observation-scopes must be per_tag, combined, all_combinations, shared, \
+                     or a JSON list of tag lists like '[[\"user:alice\"]]'"
+                )
+            }),
+    }
+}
+
+/// Update a document's tags or observation scopes
 pub fn update(
     client: &ApiClient,
     bank_id: &str,
     document_id: &str,
     tags: Option<Vec<String>>,
+    observation_scopes: Option<String>,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    if tags.is_none() {
-        anyhow::bail!("At least one of --tags must be provided");
+    if tags.is_none() && observation_scopes.is_none() {
+        anyhow::bail!("At least one of --tags or --observation-scopes must be provided");
     }
+    let observation_scopes = observation_scopes
+        .as_deref()
+        .map(parse_observation_scopes)
+        .transpose()?;
 
     let spinner = if output_format == OutputFormat::Pretty {
         Some(ui::create_spinner("Updating document..."))
@@ -289,7 +354,7 @@ pub fn update(
         None
     };
 
-    let response = client.update_document(bank_id, document_id, tags, verbose);
+    let response = client.update_document(bank_id, document_id, tags, observation_scopes, verbose);
 
     if let Some(mut sp) = spinner {
         sp.finish();
@@ -307,4 +372,41 @@ pub fn update(
         output::print_output(&result, output_format)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_observation_scopes;
+
+    #[test]
+    fn parses_modes_and_scope_lists() {
+        assert_eq!(
+            parse_observation_scopes("shared").unwrap(),
+            serde_json::json!("shared")
+        );
+        assert_eq!(
+            parse_observation_scopes(r#"[["user:alice"],[]]"#).unwrap(),
+            serde_json::json!([["user:alice"], []])
+        );
+        assert!(parse_observation_scopes("everything").is_err());
+        assert!(parse_observation_scopes(r#"["user:alice"]"#).is_err());
+    }
+
+    #[test]
+    fn parsed_scopes_fit_the_generated_request() {
+        // api.rs builds the request through serde; both shapes must land in the generated union.
+        for raw in ["shared", r#"[["user:alice"]]"#] {
+            let request: crate::api::types::UpdateDocumentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "tags": null,
+                    "observation_scopes": parse_observation_scopes(raw).unwrap(),
+                }))
+                .unwrap();
+            let round_trip = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                round_trip["observation_scopes"],
+                parse_observation_scopes(raw).unwrap()
+            );
+        }
+    }
 }

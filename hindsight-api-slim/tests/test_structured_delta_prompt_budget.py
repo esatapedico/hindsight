@@ -90,6 +90,24 @@ def test_delta_prompt_ends_with_the_date_order_rule():
     assert "later-DATED statement" in STRUCTURED_DELTA_SYSTEM_PROMPT
 
 
+def test_delta_prompt_asks_for_a_reread_of_the_opening_summary():
+    """The task tells the model to re-read the whole page, opening summary first.
+
+    #5228: a refresh fixed the block a new fact was about and left the opening summary
+    saying the old owner, with no change recorded. Its rate is graded end to end by
+    system-evals ``test_10``; this pins the instruction and its place before the
+    date-order rule.
+    """
+    prompt = build_structured_delta_prompt(
+        current_document_json='{"sections": []}',
+        supporting_facts=[{"id": "1", "text": "new fact", "type": "world"}],
+        source_query="topic?",
+    )
+    tail = prompt[prompt.index("## Task") :]
+    assert "opening summary (section id 'preamble')" in tail
+    assert tail.index("re-read CURRENT DOCUMENT") < tail.index("Facts arrive out of date order")
+
+
 def test_refresh_context_asks_full_refresh_for_dates_and_delta_for_events():
     """Full and delta refreshes get opposite advice about "current".
 
@@ -141,3 +159,38 @@ def test_an_empty_candidate_slot_gives_its_budget_to_the_document():
     with_candidate = _fit_structured_delta_prompt_parts(candidate_markdown="surviving facts", **kwargs)
     without = _fit_structured_delta_prompt_parts(candidate_markdown="", **kwargs)
     assert len(without.document_json) > len(with_candidate.document_json) * 1.4
+
+
+def test_a_small_page_leaves_its_budget_to_the_facts():
+    """A batch of new memories past the facts reserve is shown whole when the page is small.
+
+    A cut fact is never shown again: the next refresh starts after it. With a flat
+    reserve, ten new rows behind a short page lost their last five.
+    """
+    facts = "\n".join(f"- [world:{i}] Incident INC-{i} " + "detail " * 40 for i in range(300))
+    assert count_prompt_tokens(facts) > 24_000 // 8
+    fitted = _fit_structured_delta_prompt_parts(
+        source_query="q",
+        current_document_json='{"sections": []}',
+        candidate_markdown="",
+        facts_block=facts,
+        budget_hint="",
+        task_footer="## Task",
+        max_input_tokens=24_000,
+    )
+    assert fitted.facts == facts
+
+
+def test_a_full_page_still_keeps_the_facts_reserve():
+    doc = "word " * 60_000
+    fitted = _fit_structured_delta_prompt_parts(
+        source_query="q",
+        current_document_json=doc,
+        candidate_markdown="",
+        facts_block="fact " * 10_000,
+        budget_hint="",
+        task_footer="## Task",
+        max_input_tokens=24_000,
+    )
+    assert count_prompt_tokens(fitted.facts) >= 24_000 // 8 - 64
+    assert count_prompt_tokens(fitted.document_json) + count_prompt_tokens(fitted.facts) <= 24_000

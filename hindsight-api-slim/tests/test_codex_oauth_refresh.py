@@ -44,6 +44,7 @@ from hindsight_api.engine.providers.codex_llm import (
     CodexAuthManager,
     CodexLLM,
     CodexRefreshExpiredError,
+    _CodexStreamReply,
 )
 from tests.aiohttp_stub import stub_server
 from tests.codex_stream_stub import CodexReply, stub_codex_stream_with
@@ -682,7 +683,12 @@ async def test_call_reactively_refreshes_on_401_and_retries(tmp_path: Path, monk
     async with _serve_refresh(monkeypatch, endpoint):
         with (
             stub_codex_stream_with(llm, fake_backend_stream),
-            patch.object(llm, "_parse_sse_stream", new_callable=AsyncMock, return_value="ok"),
+            patch.object(
+                llm,
+                "_parse_sse_stream",
+                new_callable=AsyncMock,
+                return_value=_CodexStreamReply(text="ok", usage=None),
+            ),
         ):
             result = (
                 await llm.call(
@@ -701,29 +707,6 @@ async def test_call_reactively_refreshes_on_401_and_retries(tmp_path: Path, monk
     assert sent_headers[1]["Authorization"] == f"Bearer {new_access}"
     for header_name in ("Content-Type", "ChatGPT-Account-ID", "User-Agent", "Origin", "originator"):
         assert sent_headers[1][header_name] == sent_headers[0][header_name]
-
-
-async def test_call_with_tools_reactively_refreshes_on_401_and_retries(tmp_path: Path, monkeypatch):
-    """The tool-call path gets the same single refresh + retry on a backend 401."""
-    fresh = _make_jwt(int(time.time()) + 3600)
-    llm = _build_llm(refresh_token="rt", access_token=fresh)
-    llm._auth_file = tmp_path / "auth.json"
-    llm._auth_file.write_text(json.dumps({"tokens": {"access_token": fresh, "refresh_token": "rt"}}))
-
-    new_access = _make_jwt(int(time.time()) + 3600)
-    endpoint = _RefreshEndpoint((200, {"access_token": new_access, "refresh_token": "rt-new"}))
-    replies = [CodexReply(401, "unauthorized"), CodexReply()]
-
-    async with _serve_refresh(monkeypatch, endpoint):
-        with (
-            stub_codex_stream_with(llm, lambda url, **kwargs: replies.pop(0)) as stream,
-            patch.object(llm, "_parse_sse_tool_stream", new_callable=AsyncMock, return_value=(None, [])),
-        ):
-            await llm.call_with_tools(messages=[{"role": "user", "content": "ping"}], tools=[], max_retries=0)
-
-    assert stream.call_count == 2
-    assert len(endpoint.requests) == 1
-    assert stream.call_args.kwargs["headers"]["Authorization"] == f"Bearer {new_access}"
 
 
 async def test_call_proactively_refreshes_when_token_is_stale(tmp_path: Path, monkeypatch):
@@ -749,7 +732,12 @@ async def test_call_proactively_refreshes_when_token_is_stale(tmp_path: Path, mo
     async with _serve_refresh(monkeypatch, _RefreshEndpoint(refresh_reply)):
         with (
             stub_codex_stream_with(llm, fake_backend_stream),
-            patch.object(llm, "_parse_sse_stream", new_callable=AsyncMock, return_value="ok"),
+            patch.object(
+                llm,
+                "_parse_sse_stream",
+                new_callable=AsyncMock,
+                return_value=_CodexStreamReply(text="ok", usage=None),
+            ),
         ):
             await llm.call(
                 messages=[{"role": "user", "content": "ping"}],
@@ -771,7 +759,12 @@ async def test_call_does_not_refresh_when_token_is_fresh(tmp_path: Path, monkeyp
     async with _serve_refresh(monkeypatch, endpoint):
         with (
             stub_codex_stream_with(llm, lambda url, **kwargs: CodexReply()) as stream,
-            patch.object(llm, "_parse_sse_stream", new_callable=AsyncMock, return_value="ok"),
+            patch.object(
+                llm,
+                "_parse_sse_stream",
+                new_callable=AsyncMock,
+                return_value=_CodexStreamReply(text="ok", usage=None),
+            ),
         ):
             await llm.call(
                 messages=[{"role": "user", "content": "ping"}],

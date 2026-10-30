@@ -130,6 +130,8 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `dynamicBankGranularity` - Fields used to derive bank ID: `agent`, `channel`, `user`, `provider` (default: `["agent", "channel", "user"]`)
 - `excludeProviders` - Message providers to skip for recall/retain (e.g. `["slack"]`, `["telegram"]`, `["discord"]`)
 - `autoRecall` - Auto-inject memories before each turn (default: `true`). Set to `false` when the agent has its own recall tool.
+- `memoryMode` - `hybrid` (default): auto-recall plus the `hindsight_retain` / `hindsight_recall` / `hindsight_reflect` tools. `context`: auto-recall only. `tools`: tools only, no auto-recall. See [Agent tools](#agent-tools).
+- `allowKnowledgeDelete` - offer `hindsight_delete_knowledge_node`, which deletes a knowledge folder or page and everything under it. Cannot be undone. Default `false`. See [Agent tools](#agent-tools).
 - `autoRetain` - Auto-retain conversations after each turn (default: `true`)
 - `retainRoles` - Which message roles to retain (default: `["user", "assistant"]`). Options: `user`, `assistant`, `system`, `tool`
 - `recallBudget` - Recall effort: `"low"`, `"mid"`, or `"high"` (default: `"mid"`). Higher budgets use more retrieval strategies for better results.
@@ -143,7 +145,7 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `recallPromptPreamble` - Custom preamble text placed above recalled memories. Overrides the built-in guidance text.
 - `recallInjectionPosition` - Where to inject recalled memories: `"user"` (default), `"prepend"`, or `"append"`. The default injects before the user message and preserves the system prompt cache. Use `"prepend"` or `"append"` when memories need system-level context.
 - `recallRoles` - Which message roles to include when composing the contextual recall query (default: `["user", "assistant"]`).
-- `retainEveryNTurns` - Retain every Nth turn (default: `1` = every turn). Values > 1 enable chunked retention.
+- `retainEveryNTurns` - Retain every Nth turn (default: `1` = every turn). Values > 1 enable chunked retention. When a session ends (`/new`, `/reset`, gateway stop) the turns since the last retain are flushed; on SQLite-backed OpenClaw this needs 2026.10.1 or newer.
 - `senderPrefixPattern` - Regex matching a human display-name prefix that some channels prepend to the user's text (e.g. `Alice: today weather?`). Supply the name part only — `Alice|Bob` or `[A-Za-z ]{1,20}` — the `:` separator and anchoring are added by the plugin. When set, the prefix is stripped from both the recall query and the retained transcript, so the sender's name no longer pollutes vector search or get extracted as a fact. Unset (default) strips nothing; an invalid regex is ignored.
 - `retainOverlapTurns` - Extra prior turns included when chunked retention fires (default: `0`).
 - `debug` - Enable debug logging (default: `false`).
@@ -430,7 +432,7 @@ uvx hindsight-embed@latest -p openclaw ui
 ## OpenClaw compatibility
 
 The plugin is tested against the current OpenClaw release and against older ones.
-Version 0.12.0 and later work with **OpenClaw 2026.7.x through 2026.9.x**.
+Version 0.12.0 and later work with **OpenClaw 2026.7.x through 2026.10.x**.
 
 **If you are on OpenClaw 2026.8.1 or later, upgrade to plugin 0.12.0.** OpenClaw
 2026.8.1 changed how it labels the conversation metadata it attaches to each
@@ -521,6 +523,43 @@ openclaw config get plugins.entries.hindsight-openclaw.config.llmProvider
 
 If you used `--ref-source env`, double-check that the referenced env var
 (e.g. `OPENAI_API_KEY`) is exported in the shell that runs `openclaw gateway`.
+
+## Agent tools
+
+The plugin gives the agent the same three memory tools the Hermes integration does:
+
+- `hindsight_retain` stores something the agent wants remembered (`content`, plus optional `context`, `tags` and `occurred_at`). Configured `retainTags` are added to its tags.
+- `hindsight_recall` searches memory with the same settings as auto-recall (`recallBudget`, `recallMaxTokens`, `recallTypes`, `preferObservations`, `recallMinScores`).
+- `hindsight_reflect` answers a question by reasoning over the memories.
+
+It also gives the agent Hindsight's knowledge-base tools, the same ones Hindsight's MCP server offers:
+
+- `hindsight_get_knowledge_base_tree`, `hindsight_search_knowledge_base` and `hindsight_get_knowledge_page` browse, search and read the knowledge pages.
+- `hindsight_create_knowledge_folder`, `hindsight_create_knowledge_page` and `hindsight_update_knowledge_node` organise them and create new pages, which Hindsight writes and keeps up to date from the memories.
+- `hindsight_delete_knowledge_node` deletes a folder or page and everything under it. It cannot be undone, so it is only offered with `allowKnowledgeDelete: true`.
+
+No tool takes a bank. Each call uses the bank this session's auto-recall and auto-retain use, so `agentBankMap` and per-agent, per-channel and per-user banks all apply, and an agent can't reach another agent's or user's memory. A session that auto-recall would skip (for example one with no stable sender when banks are keyed by user) gets an error instead of a guessed bank.
+
+The session filters apply too: a session matching `ignoreSessionPatterns` gets no tools, and one matching `statelessSessionPatterns` gets no tools while `skipStatelessSessions` is on, and only the reading tools (`hindsight_recall`, `hindsight_reflect` and the knowledge-base reads) when it is off.
+
+`memoryMode` decides what the agent gets, like Hermes's `memory_mode`:
+
+- `hybrid` (default): auto-recall and the tools.
+- `context`: auto-recall only, no tools.
+- `tools`: the tools only, no auto-recall.
+
+```bash
+openclaw config set plugins.entries.hindsight-openclaw.config.memoryMode tools
+```
+
+## OpenClaw's memory page, status and search
+
+On OpenClaw 2026.10 or later, the plugin registers as OpenClaw's native memory provider. OpenClaw's own memory surfaces then read from Hindsight instead of reporting "memory plugin unavailable":
+
+- `memory.status` and the Memory page report Hindsight's health.
+- Gateway `memory.search` (with `version: 2`) and `memory.get` return Hindsight memories.
+
+Search is read-only and answers only callers allowed to see the whole bank: an operator, or the agent owner's private session. It works when an agent's bank depends on the agent alone: `dynamicBankGranularity: ["agent"]`, a static `bankId`, or an `agentBankMap` entry. When banks are keyed by user or channel (the default granularity), OpenClaw can't tell which user's bank to search, so search is refused and status still reports ready. Prompt-side recall stays with `autoRecall`, so turning this on never injects memories twice. Older OpenClaw versions ignore it.
 
 ## Limitations
 

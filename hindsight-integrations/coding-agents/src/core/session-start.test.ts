@@ -3,7 +3,10 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 import { buildSessionStartContext, runSessionStartHook } from "./session-start";
+import { startCodebaseSurvey, SURVEY_MAX_ATTEMPTS } from "./survey";
+import { releaseLease, SURVEY_SPEC_ENV } from "./survey-lease";
 import { resolveConfig } from "./config";
 import { repoNameOf } from "./git";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
@@ -64,7 +67,11 @@ describe("buildSessionStartContext", () => {
   });
 
   it("cold git repo + autoSeed on -> seeds + surveys, note in systemMessage (user-visible) + roster in additionalContext (model)", async () => {
-    const client = { listDocumentIds: async () => new Set<string>(), listPages: listPagesOk };
+    const client = {
+      listDocumentIds: async () => new Set<string>(),
+      listPages: listPagesOk,
+      hasDocuments: async () => false,
+    };
     const startSeed = vi.fn();
     const startSurvey = vi.fn().mockResolvedValue(true);
     const out = await buildSessionStartContext({
@@ -159,19 +166,69 @@ describe("buildSessionStartContext", () => {
     expect(out.deferInitialReflect).toBe(false);
   });
 
-  it("an empty but reachable page roster defers first reflect even when git documents already exist", async () => {
+  // #5209: an empty roster is not an empty bank — a bank with memories and no pages must still
+  // get its first-prompt reflect. Only a server-confirmed empty bank defers it.
+  it("an empty page roster does NOT defer first reflect when the bank already has documents", async () => {
     const out = await buildSessionStartContext({
       cwd: "/repo/dir",
       bankId: "bank-1",
-      cfg: resolveConfig(),
+      cfg: resolveConfig({ autoSeed: false }),
       client: {
-        listDocumentIds: async () => new Set(["git:abc"]),
+        listDocumentIds: async () => new Set<string>(),
         listPages: async () => ({ items: [] }),
+        hasDocuments: async () => true,
+      },
+    });
+    expect(out.deferInitialReflect).toBe(false);
+  });
+
+  it.each([
+    ["holds documents", async () => true],
+    ["cannot be probed", async () => Promise.reject(new Error("down"))],
+  ])("a cold repo does NOT defer first reflect when the bank %s", async (_, hasDocuments) => {
+    const out = await buildSessionStartContext({
+      cwd: "/repo/dir",
+      bankId: "bank-1",
+      cfg: resolveConfig({ codebaseSurvey: false }),
+      client: {
+        listDocumentIds: async () => new Set<string>(),
+        listPages: async () => ({ items: [] }),
+        hasDocuments,
       },
       hasGit: () => true,
       startSeed: vi.fn(),
     });
-    expect(out.deferInitialReflect).toBe(true);
+    expect(out.systemMessage).toContain("is learning");
+    expect(out.deferInitialReflect).toBe(false);
+  });
+
+  // #5124: with gitIngest "none" no git document is ever written, so the git check alone called
+  // every session cold and launched a new survey each time. The baseline markers prove a survey ran.
+  it("no git docs but a survey baseline exists -> warm: no new survey, no learning banner", async () => {
+    const startSurvey = vi.fn().mockResolvedValue(true);
+    const out = await buildSessionStartContext({
+      cwd: "/repo/dir",
+      bankId: "bank-1",
+      cfg: resolveConfig({ gitIngest: "none" }),
+      client: {
+        listDocumentIds: async (tag: string) =>
+          tag === "source:survey-baseline"
+            ? new Set(["survey-baseline:aaa"])
+            : tag === "source:upload"
+              ? new Set(["repository-component-map"])
+              : new Set<string>(),
+        listPages: listPagesOk,
+        hasDocuments: async () => true,
+      },
+      hasGit: () => true,
+      startSeed: vi.fn(),
+      startSurvey,
+      headSha: () => "bbb",
+      commitsSince: () => 1,
+    });
+    expect(startSurvey).not.toHaveBeenCalled();
+    expect(out.systemMessage).not.toContain("is learning");
+    expect(out.deferInitialReflect).toBe(false);
   });
 
   // The old "declined state -> no seed" test is gone with the seed-state file itself: the live
@@ -653,6 +710,58 @@ describe("buildSessionStartContext — crashed-survey retry (baseline without fi
     });
     expect(startSurvey).toHaveBeenCalledTimes(1);
     expect(out).toBeTruthy();
+  });
+});
+
+describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
+  // The outage that loops the survey is the server's extraction failing, which drops every write
+  // this hook makes — so the count must hold with every retain failing.
+  it("stops surveying a commit after SURVEY_MAX_ATTEMPTS launches, with every retain failing", async () => {
+    const leaseDir = mkdtempSync(join(tmpdir(), "hindsight-attempts-"));
+    try {
+      const spawn = vi.fn().mockImplementation(() => {
+        const child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      });
+      const startSurvey: typeof startCodebaseSurvey = async (repo, opts) => {
+        const started = await startCodebaseSurvey(repo, {
+          ...opts,
+          spawn,
+          resolveBin: (b) => b,
+          supervisorPath: "/x/survey-supervisor.js",
+          lease: { dir: leaseDir },
+        });
+        // What the supervisor does once the failed agent exits.
+        if (started) releaseLease(JSON.parse(spawn.mock.lastCall![2].env[SURVEY_SPEC_ENV]).lease);
+        return started;
+      };
+      const session = () =>
+        buildSessionStartContext({
+          cwd: "/tmp/x",
+          bankId: "bank-1",
+          cfg: resolveConfig({ surveyRefreshCommits: 50 }),
+          client: {
+            listDocumentIds: async (tag: string) =>
+              tag === "source:survey-baseline"
+                ? new Set(["survey-baseline:aaa"])
+                : tag === "source:upload"
+                  ? new Set<string>() // the findings never landed
+                  : new Set(["git:abc"]),
+            listPages: async () => ({ items: [] }),
+            retain: vi.fn().mockRejectedValue(new Error("budget_exceeded")),
+          },
+          hasGit: () => true,
+          startSeed: vi.fn(),
+          startSurvey,
+          headSha: () => "bbb",
+          commitsSince: () => 1,
+        });
+      for (let i = 0; i < SURVEY_MAX_ATTEMPTS + 2; i++) await session();
+      expect(spawn).toHaveBeenCalledTimes(SURVEY_MAX_ATTEMPTS);
+    } finally {
+      rmSync(leaseDir, { recursive: true, force: true });
+    }
   });
 });
 

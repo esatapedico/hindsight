@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { HindsightClient } from "./hindsight";
+import type { HindsightClient, RetainOpts } from "./hindsight";
 import {
   commitsSince,
   gitLogNewestAuthorDate,
@@ -52,6 +52,40 @@ describe("gitLogText", () => {
     expect(gitLogText(dir, 10)).toBe("");
   });
 
+  // #5003: the server keeps unchanged chunks only when the text before them is unchanged, so a new
+  // commit must append to the document, not shift it — including once the window is full.
+  it("appends a new commit to the previous text, stepping the window by half the limit", () => {
+    const subjects = (text: string) => text.match(/feat: c\d+/g);
+    const texts = [""];
+    for (let i = 1; i <= 9; i++) {
+      commit(dir, `feat: c${i}`);
+      texts.push(gitLogText(dir, 4));
+    }
+    expect(subjects(texts[4])).toEqual(["feat: c1", "feat: c2", "feat: c3", "feat: c4"]);
+    expect(subjects(texts[5])).toEqual(["feat: c3", "feat: c4", "feat: c5"]);
+    expect(subjects(texts[9])).toEqual(["feat: c7", "feat: c8", "feat: c9"]);
+    for (const n of [1, 2, 3, 5, 7]) {
+      expect(texts[n + 1].startsWith(`${texts[n]}\n\n---\n\n`)).toBe(true);
+    }
+  }, 30_000); // 27 git processes: slow under the parallel suite
+
+  // #5269: `log.showSignature=true` printed signature checks into the parsed output.
+  it("ignores the user's log.showSignature setting", () => {
+    const key = join(dir, "key");
+    execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+    for (const [k, v] of [
+      ["gpg.format", "ssh"],
+      ["user.signingkey", `${key}.pub`],
+      ["commit.gpgsign", "true"],
+      ["log.showSignature", "true"],
+    ])
+      execFileSync("git", ["-C", dir, "config", k, v]);
+    commit(dir, "feat: signed");
+
+    expect(gitLogNewestAuthorDate(dir)).toMatch(/^\d{4}-\d\d-\d\dT[\d:]+[+-Z][\d:]*$/);
+    expect(gitLogText(dir, 10)).toMatch(/^[0-9a-f]+ \d{4}-\d\d-\d\d Test User\nfeat: signed$/);
+  }, 30_000);
+
   it("gitLogNewestAuthorDate returns null for a repo with no commits", () => {
     expect(gitLogNewestAuthorDate(dir)).toBeNull();
   });
@@ -80,6 +114,20 @@ describe("ingestGitLog", () => {
     expect(tags).toContain("source:git-log");
     expect(strategy).toBe("gitlog");
     expect(content).toContain("feat: thing one");
+  });
+
+  it("says how many old commits a full write leaves out (#5708)", async () => {
+    for (let i = 0; i < 5; i++) commit(dir, `feat: ${i}`);
+    const client = { retain: vi.fn().mockResolvedValue(undefined), opIds: [] };
+    const lines: string[] = [];
+    await ingestGitLog(client as unknown as HindsightClient, dir, {
+      limit: 4,
+      log: (l) => lines.push(l),
+    });
+    // limit 4 moves the window in steps of 2: five commits keep the newest three.
+    expect(lines).toContain(
+      "[gitlog] dropping the 2 oldest commit(s): the document holds at most seedLimit (4)"
+    );
   });
 
   it("does not call retain for a repo with no commits, and returns 0", async () => {
@@ -202,7 +250,6 @@ describe("syncGitLog", () => {
     });
     const client = {
       retain,
-      opIds: [],
       listDocumentIds: async (tag: string) =>
         new Set([...docs].filter(([, tags]) => tags.includes(tag)).map(([id]) => id)),
       documentTags: async (id: string) => docs.get(id),
@@ -261,6 +308,173 @@ describe("syncGitLog", () => {
   });
 });
 
+describe("syncGitLog appends", () => {
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hs-gitlog-append-"));
+    initRepo(dir);
+  });
+
+  const head = (d: string) =>
+    execFileSync("git", ["-C", d, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  /** A bank that stores the git-log document the way the server does: a replace overwrites body
+   *  and tags; an append joins the new content onto the stored body with "\n" and takes the new
+   *  tags. `append: false` models a server that cannot append safely. */
+  function server({ append = true } = {}) {
+    const docs = new Map<string, { body: string; tags: string[] }>();
+    const retain = vi.fn(
+      async (
+        content: string,
+        _context: string,
+        id: string,
+        tags: string[],
+        _strategy: string,
+        opts: RetainOpts = {}
+      ) => {
+        const prior = docs.get(id);
+        const body = opts.updateMode === "append" && prior ? `${prior.body}\n${content}` : content;
+        docs.set(id, { body, tags });
+      }
+    );
+    const client = {
+      bank: "test-bank",
+      retain,
+      listDocumentIds: async (tag: string) =>
+        new Set([...docs].filter(([, d]) => d.tags.includes(tag)).map(([id]) => id)),
+      documentTags: async (id: string) => docs.get(id)?.tags,
+      supportsAppendRetain: async () => append,
+    } as unknown as HindsightClient;
+    /** What the `i`th retain asked for beyond its positional arguments. */
+    const optsOf = (i: number): RetainOpts => retain.mock.calls[i][5] ?? {};
+    return { client, retain, docs, optsOf };
+  }
+
+  it("seeds a new document with a full write, oldest commit first", async () => {
+    commit(dir, "feat: c1");
+    commit(dir, "feat: c2");
+    const { client, retain, optsOf } = server();
+
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(retain).toHaveBeenCalledTimes(1);
+    const [content] = retain.mock.calls[0];
+    expect(optsOf(0).updateMode).toBeUndefined();
+    expect(content.indexOf("feat: c1")).toBeLessThan(content.indexOf("feat: c2"));
+  });
+
+  it("appends only the commits since the recorded one, oldest first, then skips", async () => {
+    commit(dir, "feat: c1");
+    commit(dir, "feat: c2");
+    const { client, retain, docs, optsOf } = server();
+    await syncGitLog(client, dir, { limit: 10 });
+
+    commit(dir, "feat: c3");
+    commit(dir, "feat: c4");
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(retain).toHaveBeenCalledTimes(2);
+    const [content, , id, tags, strategy] = retain.mock.calls[1];
+    expect(optsOf(1).updateMode).toBe("append");
+    expect(optsOf(1).operationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(strategy).toBe("gitlog");
+    expect(content).not.toContain("feat: c1");
+    expect(content).not.toContain("feat: c2");
+    expect(content.indexOf("feat: c3")).toBeLessThan(content.indexOf("feat: c4"));
+    expect(tags).toContain(`gitlog-head:${head(dir)}`);
+    // The appended document reads exactly like a full write of the same history.
+    expect(docs.get(id)?.body).toBe(gitLogText(dir, 10));
+
+    await syncGitLog(client, dir, { limit: 10 });
+    expect(retain).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives a re-submitted append the same operation id, so the server applies it once", async () => {
+    commit(dir, "feat: c1");
+    const { client, retain, docs, optsOf } = server();
+    await syncGitLog(client, dir, { limit: 10 });
+    const seeded = structuredClone(docs.get(`gitlog:${repoNameOf(dir)}`)!);
+    commit(dir, "feat: c2");
+
+    await syncGitLog(client, dir, { limit: 10 });
+    docs.set(`gitlog:${repoNameOf(dir)}`, seeded); // the append's outcome was never learned
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(retain).toHaveBeenCalledTimes(3);
+    expect(optsOf(2).operationId).toBe(optsOf(1).operationId);
+  });
+
+  it("writes the whole log again when the recorded commit is no longer an ancestor of HEAD", async () => {
+    commit(dir, "feat: c1");
+    commit(dir, "feat: c2");
+    const { client, retain, optsOf } = server();
+    await syncGitLog(client, dir, { limit: 10 });
+
+    // Rewrite the recorded commit (an amend, as a rebase or force-push would).
+    execFileSync("git", [
+      "-C",
+      dir,
+      "commit",
+      "-q",
+      "--amend",
+      "--allow-empty",
+      "-m",
+      "feat: c2 v2",
+    ]);
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(retain).toHaveBeenCalledTimes(2);
+    const [content] = retain.mock.calls[1];
+    expect(optsOf(1).updateMode).toBeUndefined();
+    expect(content).toContain("feat: c1");
+    expect(content).toContain("feat: c2 v2");
+  });
+
+  it("writes the whole log when the server cannot append safely", async () => {
+    commit(dir, "feat: c1");
+    const { client, retain, optsOf } = server({ append: false });
+    await syncGitLog(client, dir, { limit: 10 });
+    commit(dir, "feat: c2");
+
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(retain).toHaveBeenCalledTimes(2);
+    expect(optsOf(1).updateMode).toBeUndefined();
+    expect(retain.mock.calls[1][0]).toContain("feat: c1");
+  });
+
+  it("writes the bounded log instead of appending more new commits than the limit", async () => {
+    commit(dir, "feat: c1");
+    const { client, retain, optsOf } = server();
+    await syncGitLog(client, dir, { limit: 2 });
+    for (const c of ["c2", "c3", "c4"]) commit(dir, `feat: ${c}`);
+
+    await syncGitLog(client, dir, { limit: 2 });
+
+    expect(retain).toHaveBeenCalledTimes(2);
+    expect(optsOf(1).updateMode).toBeUndefined();
+  });
+
+  it("appends a merged branch's commits after the stored ones instead of rewriting the log", async () => {
+    commit(dir, "feat: c1");
+    const { client, docs, optsOf } = server();
+    await syncGitLog(client, dir, { limit: 10 });
+    const stored = docs.get(`gitlog:${repoNameOf(dir)}`)!.body;
+    execFileSync("git", ["-C", dir, "checkout", "-q", "-b", "side"]);
+    commit(dir, "feat: on the side branch");
+    execFileSync("git", ["-C", dir, "checkout", "-q", "-"]);
+    commit(dir, "feat: c2");
+    execFileSync("git", ["-C", dir, "merge", "-q", "--no-ff", "--no-edit", "side"]);
+
+    await syncGitLog(client, dir, { limit: 10 });
+
+    expect(optsOf(1).updateMode).toBe("append");
+    const body = docs.get(`gitlog:${repoNameOf(dir)}`)!.body;
+    expect(body.startsWith(stored)).toBe(true);
+    expect(body).toContain("feat: on the side branch");
+    expect(body).toContain("feat: c2");
+  });
+});
+
 describe("commitsSince", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "hs-commits-since-"));
@@ -283,5 +497,23 @@ describe("commitsSince", () => {
     // `--output=<path>..HEAD` creates that file before git rejects the command.
     expect(commitsSince(dir, `--output=${planted}`)).toBeNull();
     expect(existsSync(`${planted}..HEAD`)).toBe(false);
+  });
+
+  // A partial clone would fetch an unknown sha from its remote, seconds per run to fail (#5606).
+  it.skipIf(process.platform === "win32")("never lets git fetch a missing sha", () => {
+    const bin = join(dir, "bin");
+    execFileSync("mkdir", [bin]);
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\necho "$GIT_NO_LAZY_FETCH" > "${bin}/env"\necho 0\n`
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+    try {
+      expect(commitsSince(dir, "a".repeat(40))).toBe(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(readFileSync(join(bin, "env"), "utf8").trim()).toBe("1");
   });
 });

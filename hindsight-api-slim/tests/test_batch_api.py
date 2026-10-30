@@ -282,9 +282,55 @@ async def test_batch_api_accepts_top_level_fact_list(mock_llm_config, test_conte
 
     assert len(facts) == 1
     assert "Alice" in facts[0].fact_text
+    assert "Where: TechCorp" in facts[0].fact_text  # #6129
     assert len(chunks) == 1
     assert chunks[0].fact_count == 1
     assert usage.total_tokens == 150
+
+
+@pytest.mark.asyncio
+async def test_batch_api_usage_keeps_cached_and_reasoning_tokens(mock_llm_config, test_contents, hindsight_config):
+    """Batch usage is read like a live call's: cached prompt and reasoning tokens survive (#5487)."""
+    mock_llm_config._provider_impl.supports_batch_api = AsyncMock(return_value=True)
+    mock_llm_config._provider_impl.submit_batch = AsyncMock(
+        return_value={"batch_id": "batch_usage", "status": "validating", "request_counts": {"total": 1}}
+    )
+    mock_llm_config._provider_impl.get_batch_status = AsyncMock(
+        return_value={"status": "completed", "request_counts": {"total": 1, "completed": 1, "failed": 0}}
+    )
+    mock_llm_config._provider_impl.retrieve_batch_results = AsyncMock(
+        return_value=[
+            {
+                "custom_id": "chunk_0",
+                "response": {
+                    "body": {
+                        "choices": [{"message": {"content": json.dumps({"facts": []})}}],
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 50,
+                            "total_tokens": 150,
+                            "prompt_tokens_details": {"cached_tokens": 80},
+                            "completion_tokens_details": {"reasoning_tokens": 20},
+                        },
+                    }
+                },
+            }
+        ]
+    )
+
+    extraction = await extract_facts_from_contents_batch_api(
+        contents=[test_contents[0]],
+        llm_config=mock_llm_config,
+        config=hindsight_config,
+        pool=None,
+        operation_id=None,
+        schema=None,
+    )
+
+    assert extraction.usage.input_tokens == 100
+    assert extraction.usage.cached_tokens == 80
+    assert extraction.usage.thoughts_tokens == 20
+    assert extraction.usage.output_tokens == 30  # reasoning folded into completion is split out
 
 
 @pytest.mark.asyncio
@@ -402,6 +448,56 @@ async def test_batch_api_records_schema_drifted_facts_as_extraction_errors(
     assert recorded[0].sample == [
         "chunk_0: fact 0 has no 'what'/'factual_core'/'text' field; keys present: fact_type, when, who"
     ]
+
+
+@pytest.mark.asyncio
+async def test_batch_api_records_missing_facts_key_as_extraction_error(
+    mock_llm_config, test_contents, hindsight_config
+):
+    """Issue #5582: a reply with no top-level 'facts' list is a broken envelope,
+    not an empty extraction — it must reach extraction_errors, not pass as 0 facts."""
+    mock_llm_config._provider_impl.supports_batch_api = AsyncMock(return_value=True)
+    mock_llm_config._provider_impl.submit_batch = AsyncMock(return_value={"batch_id": "batch_no_facts_key"})
+    mock_llm_config._provider_impl.get_batch_status = AsyncMock(
+        return_value={"status": "completed", "request_counts": {"total": 1, "completed": 1, "failed": 0}}
+    )
+    wrapped = {"final": {"facts": [{"what": "Alice visited Paris", "fact_type": "world"}]}}
+    mock_llm_config._provider_impl.retrieve_batch_results = AsyncMock(
+        return_value=[
+            {
+                "custom_id": "chunk_0",
+                "response": {
+                    "body": {
+                        "choices": [{"message": {"content": json.dumps(wrapped)}}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+                    }
+                },
+            }
+        ]
+    )
+
+    recorded = []
+
+    async def _capture(pool, operation_id, schema, errors):
+        recorded.append(errors)
+
+    with patch(
+        "hindsight_api.engine.retain.fact_extraction._write_batch_extraction_errors",
+        side_effect=_capture,
+    ):
+        extraction = await extract_facts_from_contents_batch_api(
+            contents=[test_contents[0]],
+            llm_config=mock_llm_config,
+            config=hindsight_config,
+            pool=None,
+            operation_id=None,
+            schema=None,
+        )
+
+    assert extraction.facts == []
+    assert extraction.chunks[0].fact_count == 0
+    assert len(recorded) == 1
+    assert recorded[0].sample == ["chunk_0: LLM reply had no top-level 'facts' list (dict)"]
 
 
 @pytest.mark.asyncio

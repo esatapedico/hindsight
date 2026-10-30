@@ -305,6 +305,37 @@ def test_build_llm_per_op_inherits_global(clean_llm_env):
     assert [m.provider for m in result.members[1:]] == ["ollama"]  # inherited
 
 
+def test_build_llm_fallback_slot_inherits_global_when_empty(clean_llm_env):
+    # Refresh -> empty reflect slot must keep going to the global chain (#5724).
+    config = _empty_config(
+        llm_members=[_member("ollama")],
+        llm_strategy=LLMStrategyConfig(mode="failover"),
+        reflect_llm_members=[],
+        reflect_llm_strategy=None,
+        mental_model_refresh_llm_members=[],
+        mental_model_refresh_llm_strategy=None,
+    )
+    result = _build_llm(_base_llm(), config, "mental_model_refresh_", _NO_CALL_DEFAULTS, fallback_prefix="reflect_")
+    assert isinstance(result, MultiLLMProvider)
+    assert [m.provider for m in result.members[1:]] == ["ollama"]
+    assert result.strategy.mode == "failover"
+
+
+def test_build_llm_fallback_slot_wins_over_global(clean_llm_env):
+    config = _empty_config(
+        llm_members=[_member("ollama")],
+        llm_strategy=LLMStrategyConfig(mode="failover"),
+        reflect_llm_members=[_member("lmstudio")],
+        reflect_llm_strategy=LLMStrategyConfig(mode="round-robin"),
+        mental_model_refresh_llm_members=[],
+        mental_model_refresh_llm_strategy=None,
+    )
+    result = _build_llm(_base_llm(), config, "mental_model_refresh_", _NO_CALL_DEFAULTS, fallback_prefix="reflect_")
+    assert isinstance(result, MultiLLMProvider)
+    assert [m.provider for m in result.members[1:]] == ["lmstudio"]
+    assert result.strategy.mode == "round-robin"
+
+
 def test_build_llm_per_op_overrides_global(clean_llm_env):
     config = _empty_config(
         llm_members=[_member("ollama")],
@@ -397,7 +428,9 @@ def test_member_to_llm_passes_vertexai_service_account_key(clean_llm_env, monkey
             captured.update(kwargs)
 
     monkeypatch.setattr(llm_wrapper, "VERTEXAI_AVAILABLE", True)
-    monkeypatch.setattr(llm_wrapper, "service_account", _FakeServiceAccount)
+    from google.oauth2 import service_account
+
+    monkeypatch.setattr(service_account, "Credentials", _FakeServiceAccount.Credentials)
     monkeypatch.setattr(gemini_llm.genai, "Client", _FakeClient)
     clear_config_cache()
 
@@ -704,3 +737,66 @@ def test_chain_can_fail_fast_on_primary_while_fallback_still_retries(clean_llm_e
     fallback = _parse_llm_members("")[0]
     assert primary_policy.max_retries == 0
     assert _member_call_defaults(fallback, primary_policy)["max_retries"] == 2
+
+
+# ── a member whose sign-in is gone (#6095) ──────────────────────────────────────
+
+
+@pytest.fixture
+def logged_out(clean_llm_env, tmp_path):
+    """Every sign-in based provider looks in an empty home: nobody is logged in."""
+    from hindsight_api.config import clear_config_cache
+
+    clean_llm_env.setenv("HOME", str(tmp_path))
+    for var in ("CODEX_HOME", "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        clean_llm_env.delenv(var, raising=False)
+    clear_config_cache()
+    yield
+    clear_config_cache()
+
+
+# Every provider that reads a stored sign-in while it is built. A new one belongs here
+# too, or a lost login on it crash-loops the server again.
+@pytest.mark.parametrize("provider", ["chatgpt", "openai-codex", "nous", "github-copilot"])
+async def test_logged_out_provider_builds_and_fails_each_call(logged_out, provider):
+    from hindsight_api.engine.llm_interface import ProviderUnavailableError
+    from hindsight_api.engine.providers.none_llm import UnavailableLLM
+
+    llm = LLMProvider(provider=provider, api_key="", base_url="", model="m")  # used to raise here
+
+    assert isinstance(llm._provider_impl, UnavailableLLM)
+    assert llm.provider == provider  # not mistaken for provider "none"
+    with pytest.raises(ProviderUnavailableError):
+        await llm.verify_connection()
+    with pytest.raises(ProviderUnavailableError):
+        await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+
+async def test_logged_out_primary_fails_over_to_next_member(logged_out):
+    base = LLMProvider(provider="chatgpt", api_key="", base_url="", model="gpt-5")
+    config = _empty_config(llm_members=[_member("mock")], llm_strategy=LLMStrategyConfig(mode="failover"))
+    chain = _build_llm(base, config, "", _NO_CALL_DEFAULTS)
+
+    await chain.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+    assert len(chain.members[1]._provider_impl._mock_calls) == 1
+
+
+async def test_logged_out_middle_member_keeps_the_rest_of_the_chain(logged_out):
+    config = _empty_config(
+        llm_members=[_member("chatgpt"), _member("mock")],
+        llm_strategy=LLMStrategyConfig(mode="failover"),
+    )
+    primary = _base_llm()
+    primary._provider_impl._mock_exception = RuntimeError("primary down")
+    chain = _build_llm(primary, config, "", _NO_CALL_DEFAULTS)
+
+    await chain.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+    # Primary failed, the logged-out middle member failed, the last member answered.
+    assert len(chain.members[2]._provider_impl._mock_calls) == 1
+
+
+def test_unknown_provider_still_fails_startup(clean_llm_env):
+    with pytest.raises(ValueError):
+        LLMProvider(provider="no-such-provider", api_key="k", base_url="", model="m")

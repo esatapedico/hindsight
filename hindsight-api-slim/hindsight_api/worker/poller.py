@@ -30,6 +30,7 @@ from ..config import (
 )
 from ..engine.schema import fq_table_explicit as fq_table
 from ..metrics import get_metrics_collector
+from ..operation_runs import worker_task
 from .backpressure import is_append_conflict, is_store_backpressure
 from .exceptions import DeferOperation, RetryTaskAt, format_task_error
 
@@ -46,6 +47,7 @@ def _backpressure_defer_seconds() -> int:
     return get_config().backpressure_defer_seconds
 
 
+from .background import mark_background_task
 from .stage import StageHolder, bind_holder
 
 # How a lost append race backs off. An append that loses is told "the document moved, read it
@@ -224,6 +226,28 @@ PROGRESS_LOG_INTERVAL = 30
 TERMINAL_WRITE_DEADLINE_S = 300.0
 TERMINAL_WRITE_MAX_BACKOFF_S = 30.0
 
+# A terminal write that fails because the task's own operations table is gone
+# can never succeed: the schema was dropped (the tenant was deleted) while the
+# task ran, and the row went with it. Postgres reports a missing relation or
+# schema by SQLSTATE; Oracle by ORA code in the message.
+_MISSING_RELATION_SQLSTATES = frozenset({"42P01", "3F000"})  # undefined_table, invalid_schema_name
+_MISSING_RELATION_MARKERS = ("ORA-00942",)  # table or view does not exist
+
+
+def _is_missing_relation(exc: BaseException) -> bool:
+    """Does `exc`, or anything it wraps, say a table or schema does not exist?"""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "sqlstate", None) in _MISSING_RELATION_SQLSTATES:
+            return True
+        if any(marker in str(cur) for marker in _MISSING_RELATION_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 # Stuck-task stack-dump thresholds (seconds). Each task gets one stack dump
 # per threshold its current stage crosses without making progress.
 STUCK_STACK_INITIAL_THRESHOLD_S = 300
@@ -289,6 +313,8 @@ class ClaimedTask:
     task_dict: dict[str, Any]
     schema: str | None
     folded_operation_ids: list[str] = field(default_factory=list)
+    #: When the task was queued (its row's ``created_at``), for the operation runs it executes.
+    queued_at: datetime | None = None
     """Peers coalesced into this execution (see ``engine.retain.fold``).
 
     They were claimed by the same transaction that claimed ``operation_id`` and
@@ -340,7 +366,7 @@ class WorkerPoller:
         slot_reservations: dict[str, int] | None = None,
         consolidation_bank_priority: dict[str, int] | None = None,
         max_retries: int = 3,
-        on_wall_timeout: Callable[[dict[str, Any], str | None, str], Awaitable[None]] | None = None,
+        on_wall_timeout: Callable[[dict[str, Any], str | None, str, str], Awaitable[None]] | None = None,
     ):
         """
         Initialize the worker poller.
@@ -366,7 +392,7 @@ class WorkerPoller:
             max_retries: Maximum retry attempts before a task is marked failed.
                 Must be >= 0. Default 3 (matches DEFAULT_WORKER_MAX_RETRIES).
             on_wall_timeout: Optional async hook called with (task_dict, schema,
-                error_message) after a task is failed by its wall-clock ceiling.
+                error_message, stage) after a task is failed by its wall-clock ceiling.
                 The ceiling cancels the executor, so the engine's own failure
                 handling (which fires the consolidation failure webhook) never
                 runs for that outcome; this hook is how the engine still gets told.
@@ -401,10 +427,16 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
+        # Set when a task finishes: the idle poll wakes at once to fill the freed slot
+        # instead of sleeping out the rest of poll_interval_ms (#5650). A new submit
+        # deliberately does NOT wake it: the wait is what lets repeated refresh and
+        # consolidation submits fold into one still-pending operation (see #4335).
+        self._slot_freed = asyncio.Event()
         self._current_tasks: set[asyncio.Task] = set()
         self._in_flight_count = 0
         self._in_flight_lock = asyncio.Lock()
-        self._last_progress_log = 0.0
+        # A perf_counter reading; -inf so the first call logs whatever that clock's origin is.
+        self._last_progress_log = float("-inf")
         self._tasks_completed_since_log = 0
         # Monotonic stamp of the last completed claim cycle. Reported by the
         # liveness probe so operators can alert on a poller that stopped making
@@ -429,6 +461,10 @@ class WorkerPoller:
         # this worker has never claimed for, so only a range can discover it.
         # Empty string starts a round; claim_tasks resets to it at the end of one.
         self._next_bank_cursor: dict[str | None, str] = {}
+        # Every schema this process has claimed a row in. Shutdown hands back only
+        # what this worker owns, and it can only own rows where it claimed, so
+        # release_own_tasks walks these instead of every tenant schema.
+        self._claimed_schemas: set[str | None] = set()
         # Retention cleanup runs outside the claim loop. Keep one task per
         # poller so maintenance cannot overlap with itself or block slot refill.
 
@@ -738,6 +774,9 @@ class WorkerPoller:
             # picks the bank, so this costs no extra statement to learn.
             self._next_bank_cursor[schema] = claimed.next_bank_cursor
             all_rows = claimed.rows
+            if all_rows:
+                # Before anything below can fail: once claimed, the row is ours to release.
+                self._claimed_schemas.add(schema)
 
             if not all_rows:
                 return []
@@ -761,6 +800,7 @@ class WorkerPoller:
                         task_dict=task_dict,
                         schema=schema,
                         folded_operation_ids=folded,
+                        queued_at=row.get("created_at"),
                     )
                 )
             return result
@@ -1169,6 +1209,7 @@ class WorkerPoller:
                     self._in_flight_by_type[operation_type] = count - 1
                     if self._in_flight_by_type[operation_type] == 0:
                         del self._in_flight_by_type[operation_type]
+                self._slot_freed.set()
 
     async def _run_executor(self, task: ClaimedTask, task_type: str, holder: StageHolder | None = None) -> None:
         """Run the task executor under its type's wall-clock ceiling, if it has one."""
@@ -1214,7 +1255,7 @@ class WorkerPoller:
                 raise _WallTimeoutExceeded(wall_timeout, ceiling) from e
             raise
 
-    async def _notify_wall_timeout(self, task: ClaimedTask, message: str) -> None:
+    async def _notify_wall_timeout(self, task: ClaimedTask, message: str, stage: str) -> None:
         """Tell the engine a task was failed by its ceiling. Never fatal.
 
         The whole point of the ceiling is that it cancels the executor, which means
@@ -1225,7 +1266,7 @@ class WorkerPoller:
         if self._on_wall_timeout is None:
             return
         try:
-            await self._on_wall_timeout(task.task_dict, task.schema, message)
+            await self._on_wall_timeout(task.task_dict, task.schema, message, stage)
         except Exception as e:
             logger.warning(f"Wall-timeout notification failed for task {task.operation_id}: {e}")
 
@@ -1253,10 +1294,14 @@ class WorkerPoller:
         # failure visibility use the hindsight_async_operations{status="failed"} gauge,
         # which reads each operation's final DB status.
         op_label = _metric_operation_label(task.task_dict.get("operation_type") or task_type)
-        op_start = time.time()
+        op_start = time.perf_counter()
         metrics = get_metrics_collector()
         # None = not a terminal outcome (deferred/retried) → no metric.
         terminal_success: bool | None = None
+
+        # Every task the worker runs is background work, whatever its holder. The LLM
+        # semaphore uses this to serve waiting live requests first.
+        mark_background_task()
 
         # Bind the stage holder in this task's own contextvar scope so engine
         # code running under us can update it via stage.set_stage(). If holder
@@ -1271,7 +1316,8 @@ class WorkerPoller:
             logger.debug(f"Executing task {task.operation_id} (type={task_type}, bank={bank_id}{schema_info})")
             if task.schema:
                 task.task_dict["_schema"] = task.schema
-            await self._run_executor(task, task_type, holder)
+            with worker_task(task.operation_id, task.queued_at):
+                await self._run_executor(task, task_type, holder)
             logger.debug(f"Task {task.operation_id} execution finished")
         except _WallTimeoutExceeded as e:
             # The executor has already been cancelled; all that's left is to say so
@@ -1283,7 +1329,7 @@ class WorkerPoller:
             message = e.describe(task_type, stage)
             logger.error(f"Task {task.operation_id} timed out: {message}")
             await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
-            await self._notify_wall_timeout(task, message)
+            await self._notify_wall_timeout(task, message, stage)
             terminal_success = False
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
@@ -1361,7 +1407,11 @@ class WorkerPoller:
         if terminal_success is not None:
             try:
                 metrics.record_operation_result(
-                    op_label, bank_id, success=terminal_success, duration=time.time() - op_start, source="worker"
+                    op_label,
+                    bank_id,
+                    success=terminal_success,
+                    duration=time.perf_counter() - op_start,
+                    source="worker",
                 )
             except Exception:
                 logger.warning(f"Failed to record worker operation metric for {task.operation_id}", exc_info=True)
@@ -1391,6 +1441,15 @@ class WorkerPoller:
                 await write()
                 return True
             except Exception as e:
+                if await self._operations_table_dropped(task, e):
+                    # Nothing to mark and nothing to recover: retrying would only
+                    # run out the deadline and take the worker (and every other
+                    # task on it) down with it.
+                    logger.warning(
+                        f"Not marking task {task.operation_id} {status}: schema {task.schema} no longer has "
+                        f"an operations table (dropped while the task ran); dropping the task"
+                    )
+                    return False
                 if time.monotonic() + delay > deadline:
                     logger.critical(
                         f"Could not mark task {task.operation_id} {status} for {TERMINAL_WRITE_DEADLINE_S:.0f}s "
@@ -1406,6 +1465,25 @@ class WorkerPoller:
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, TERMINAL_WRITE_MAX_BACKOFF_S)
+
+    async def _operations_table_dropped(self, task: ClaimedTask, error: BaseException) -> bool:
+        """Is the task's own operations table gone, not just this write failing?
+
+        A missing-relation error alone is not enough: the write may touch other
+        tables, and one missing there is a bug to surface, not a reason to drop
+        the status. So confirm by reading the operations table itself. A read
+        that fails for any other reason (the DB being unwell) means "not
+        proven", and the caller keeps retrying.
+        """
+        if task.schema is None or not _is_missing_relation(error):
+            return False
+        table = fq_table("async_operations", task.schema)
+        try:
+            async with self._backend.acquire() as conn:
+                await conn.fetchval(f"SELECT 1 FROM {table} WHERE 1 = 0")
+        except Exception as probe_error:
+            return _is_missing_relation(probe_error)
+        return False
 
     def _exit_process(self) -> None:
         """Ask the process to shut down, through the same path as `kill`."""
@@ -1567,20 +1645,20 @@ class WorkerPoller:
         rows claimed before startup and the parent pass re-checks each parent
         under a row lock.
 
+        Only the schemas this process claimed in are visited. With thousands of
+        tenant schemas, a walk over all of them takes longer than a typical
+        termination grace period, and the process is killed partway through —
+        the very stranding this release exists to prevent. Rows a previous run
+        under the same worker id left behind elsewhere are startup recovery's.
+
         Returns:
             Number of operations returned to pending.
         """
         # Nothing here may raise: this runs on the shutdown path, where the DB
         # being unwell is exactly the case that strands rows, and an exception
         # escaping would abort the rest of the teardown.
-        try:
-            schemas = await self._get_schemas()
-        except Exception as e:
-            logger.warning(f"Worker {self._worker_id} could not list schemas to release its in-flight tasks: {e}")
-            return 0
-
         total_count = 0
-        for schema in schemas:
+        for schema in list(self._claimed_schemas):
             try:
                 total_count += await self._reclaim_own_processing_tasks(schema)
             except Exception as e:
@@ -1846,6 +1924,8 @@ class WorkerPoller:
 
         while not self._shutdown.is_set():
             try:
+                # Cleared before the claim: a slot freed during it re-arms the wait below.
+                self._slot_freed.clear()
                 # Claim a batch of tasks (respecting slot limits)
                 tasks = await self.claim_batch()
                 self._last_poll_at = time.monotonic()
@@ -1879,15 +1959,16 @@ class WorkerPoller:
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
-                # No tasks claimed (either no pending tasks or slots full)
-                # Wait before polling again
+                # No tasks claimed (either no pending tasks or slots full).
+                # Wait for the poll interval, shutdown, or a task finishing.
+                waiters = [asyncio.ensure_future(self._shutdown.wait()), asyncio.ensure_future(self._slot_freed.wait())]
                 try:
-                    await asyncio.wait_for(
-                        self._shutdown.wait(),
-                        timeout=self._poll_interval_ms / 1000,
+                    await asyncio.wait(
+                        waiters, timeout=self._poll_interval_ms / 1000, return_when=asyncio.FIRST_COMPLETED
                     )
-                except asyncio.TimeoutError:
-                    pass  # Normal timeout, continue polling
+                finally:
+                    for w in waiters:
+                        w.cancel()
 
                 # Log progress stats periodically
                 await self._log_progress_if_due()
@@ -1978,7 +2059,7 @@ class WorkerPoller:
           * [STUCK_STACK]   - async stack trace for tasks past stuck thresholds
           * [DB_WAITS]      - any non-idle hindsight session waiting on a lock
         """
-        now = time.time()
+        now = time.perf_counter()
         if now - self._last_progress_log < PROGRESS_LOG_INTERVAL:
             return
 
@@ -2043,10 +2124,12 @@ class WorkerPoller:
                 for schema in schemas_to_query:
                     table = fq_table("async_operations", schema)
 
-                    # Bucket pending rows by the same predicates the claim query
-                    # filters on, so an operator can see why pending > 0 but
-                    # nothing is being claimed (orphaned batch_retain parents,
-                    # retry backoff, etc.).
+                    # Bucket pending rows by the claim-query predicates that are
+                    # cheap to count here, so an operator can see why pending > 0
+                    # but nothing is being claimed (orphaned batch_retain parents,
+                    # retry backoff, etc.). Deliberately a *subset* of the claim
+                    # predicate — the serialization exclusions are left out, see
+                    # _log_pending_breakdown.
                     # Use SUM(CASE WHEN ...) instead of COUNT(*) FILTER (WHERE ...)
                     # for Oracle compatibility — FILTER is PG-specific.
                     try:
@@ -2218,10 +2301,15 @@ class WorkerPoller:
           * retry_blocked  - next_retry_at is still in the future
           * assigned       - worker_id already set; another worker owns it
 
-        ``claimable`` is the residual that *should* be picked up on the next
-        poll. If ``claimable > 0`` while workers report free slots, the bug is
-        somewhere else (lock contention, tenant discovery, etc.) - this line
-        narrows the search.
+        There is deliberately no ``claimable`` residual here. The claim query
+        also applies ``bank_serialization_sql`` and ``key_serialization_sql``
+        (``engine/db/ops.py``), and a row queued behind a peer on the same bank
+        or the same serialization key is not claimable either. A residual that
+        ignores both overstates - it reported 11 claimable retains where the
+        predicate allowed 6 (#4527) - and made a queue that was merely lining
+        up read as a wedged one. Counting the two exclusions would mean
+        re-running the claim predicate purely to log it, so these buckets state
+        only what they can cheaply prove.
         """
         if not breakdown:
             return
@@ -2229,9 +2317,8 @@ class WorkerPoller:
         parts = []
         for op_type in sorted(breakdown):
             b = breakdown[op_type]
-            claimable = b["total"] - b["payload_null"] - b["retry_blocked"] - b["assigned"]
             parts.append(
-                f"{op_type}: total={b['total']} claimable={claimable} "
+                f"{op_type}: total={b['total']} "
                 f"payload_null={b['payload_null']} retry_blocked={b['retry_blocked']} "
                 f"assigned={b['assigned']}"
             )

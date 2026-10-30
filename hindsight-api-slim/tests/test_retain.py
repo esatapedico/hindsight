@@ -9,7 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from hindsight_api.engine.memory_engine import Budget, MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.response_models import Budget
+from tests.consolidation_answers import fact_answer
 from tests.llm_judge import assert_meets_criteria
 
 logger = logging.getLogger(__name__)
@@ -3268,11 +3270,9 @@ def _make_mock_llm_call():
     """Create a mock LLM call function that returns deterministic facts."""
 
     async def mock_llm_call(*args, **kwargs):
-        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
         if kwargs.get("scope") == "consolidation":
             return LLMCallResult(
-                content=_ConsolidationBatchResponse(),
+                content=fact_answer(),
                 usage=TokenUsage(input_tokens=0, output_tokens=0),
             )
 
@@ -3906,3 +3906,34 @@ class TestFactExtractionQuality:
             )
         finally:
             await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_multi_document_retain_bounds_group_fan_out_on_sql_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-document retain on the SQL path (no store-owned session) must not run every
+    document at once. Each in-flight document holds a pool connection while acquiring another,
+    so a fan-out wider than the pool deadlocks it (#5442). The groups run through the recursive
+    ``retain_batch`` call, so wrapping it counts how many are in flight at the same time.
+    """
+    from hindsight_api.engine.response_models import TokenUsage
+    from hindsight_api.engine.retain import orchestrator
+    from hindsight_api.engine.retain.types import RetainBatchResult
+
+    real_retain_batch = orchestrator.retain_batch
+    in_flight = 0
+    peak = 0
+
+    async def counting_group(*args: object, contents_dicts: list, **kwargs: object) -> RetainBatchResult:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return RetainBatchResult([[] for _ in contents_dicts], TokenUsage(), 0)
+
+    monkeypatch.setattr(orchestrator, "retain_batch", counting_group)
+
+    docs = [{"content": f"item {i}", "document_id": f"doc-{i}"} for i in range(40)]
+    await real_retain_batch(None, None, None, None, None, "bank", docs, None)
+
+    assert 1 < peak <= 8

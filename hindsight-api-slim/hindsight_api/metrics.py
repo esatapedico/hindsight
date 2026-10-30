@@ -30,15 +30,15 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 
+from hindsight_api.operation_runs import add_phase
+from hindsight_api.schema_context import _current_schema, get_current_schema
+
 if TYPE_CHECKING:
     import asyncpg
 
 
 def _get_tenant() -> str:
     """Get current tenant (schema) from context for metrics labeling."""
-    # Import here to avoid circular imports
-    from hindsight_api.engine.memory_engine import get_current_schema
-
     return get_current_schema()
 
 
@@ -69,7 +69,10 @@ def _is_client_cancellation(exc: BaseException) -> bool:
 
     An abandoned recall/reflect raises OperationCancelledError (issue #2122);
     the HTTP layer re-raises it as ``HTTPException(499) from exc`` (see
-    api/http.py run_cancellable_on_disconnect). The exception itself, or any
+    api/http.py run_cancellable_on_disconnect). The hard-cancel path
+    (run_task_cancellable_on_disconnect) has no such error to re-raise, so it
+    chains a fresh one; before #5946 it raised a bare 499 and every hard
+    disconnect counted as a failure. The exception itself, or any
     link in its ``__cause__`` chain, being an OperationCancelledError marks it
     as a cancellation. Matching on the cause chain rather than a bare status
     code avoids misclassifying an unrelated 499 as a cancellation. Per the
@@ -417,13 +420,14 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         pass
 
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
-        pass
+        add_phase(f"retain.{phase}", seconds)
 
     def record_validator_phase(self, operation: str, hook: str, seconds: float):
         pass
 
     def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
-        pass
+        if not diagnostic:
+            add_phase(f"recall.{phase}", seconds)
 
     def record_loop_stall(self, stall_seconds: float):
         """No-op loop-stall recording."""
@@ -686,7 +690,7 @@ class MetricsCollector(MetricsCollectorBase):
             budget: Optional budget level (low, mid, high)
             max_tokens: Optional max tokens for the operation
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         success = True
         cancelled = False
         # Resolved once, and published for the length of the operation so the recall phases
@@ -715,7 +719,7 @@ class MetricsCollector(MetricsCollectorBase):
                     operation,
                     bank_id,
                     success=success,
-                    duration=time.time() - start_time,
+                    duration=time.perf_counter() - start_time,
                     source=source,
                     budget=budget,
                     max_tokens=max_tokens,
@@ -864,7 +868,7 @@ class MetricsCollector(MetricsCollectorBase):
             endpoint: Request endpoint path
             status_code_getter: Callable that returns the status code after request completes
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         base_attributes = {"method": method, "endpoint": endpoint}
 
         # Track in-progress
@@ -873,7 +877,7 @@ class MetricsCollector(MetricsCollectorBase):
         try:
             yield
         finally:
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             status_code = status_code_getter()
             status_class = f"{status_code // 100}xx"
 
@@ -898,6 +902,7 @@ class MetricsCollector(MetricsCollectorBase):
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
         """Record one phase of a retain. `store` labels which memories backend served it, so a
         store-owned bank's profile is separable from a Postgres one on the same deployment."""
+        add_phase(f"retain.{phase}", seconds)
         attrs = {"phase": phase, **self._tenant_attrs()}
         if store:
             attrs["store"] = store
@@ -916,6 +921,9 @@ class MetricsCollector(MetricsCollectorBase):
         per-arm timing inside `parallel_retrieval`, say — so a consumer summing phases into a
         request total can exclude them instead of double-counting.
         """
+        if not diagnostic:
+            # Every recall's phases, whatever the sampling below: the run is per recall.
+            add_phase(f"recall.{phase}", seconds)
         if diagnostic and not self._record_diagnostic_phases:
             return
         # Opt-in sampling: ~10 phases per recall each go through OTel's aggregation, which was
@@ -1280,25 +1288,32 @@ class MetricsCollector(MetricsCollectorBase):
                     rows = await conn.fetch(f'SELECT bank_id FROM "{schema}".banks')
                     return [row["bank_id"] for row in rows]
 
+                # A store-owned backend derives where a bank's memories live from the request
+                # schema, so set it as a request would; left unset, every schema's banks resolve
+                # against the default schema and drop out of these gauges.
+                token = _current_schema.set(schema)
                 try:
-                    counts = await get_memories().count_consolidation_backlog(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        backlog[key] = backlog.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_backlog(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            backlog[key] = backlog.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
 
-                try:
-                    counts = await get_memories().count_consolidation_failed(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        failed[key] = failed.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_failed(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            failed[key] = failed.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                finally:
+                    _current_schema.reset(token)
 
         self._async_ops_counts = async_ops
         self._consolidation_backlog = backlog

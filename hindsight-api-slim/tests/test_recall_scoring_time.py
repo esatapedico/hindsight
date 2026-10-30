@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hindsight_api.engine import memory_engine
-from hindsight_api.engine.memory_engine import Budget
+from hindsight_api.engine.response_models import Budget
 from hindsight_api.engine.search.reranking import RerankResult
 from hindsight_api.engine.search.retrieval import MultiFactTypeRetrievalResult, ParallelRetrievalResult
 from hindsight_api.engine.search.types import RetrievalResult, ScoredResult
@@ -25,7 +25,7 @@ class _Reranker:
     async def ensure_initialized(self) -> None:
         return None
 
-    async def rerank(self, _query: str, candidates: list[Any]) -> RerankResult:
+    async def rerank(self, _query: str, candidates: list[Any], now=None, **_options) -> RerankResult:
         return RerankResult(
             results=[
                 ScoredResult(
@@ -64,6 +64,9 @@ def test_recall_scoring_now_falls_back_to_current_time(monkeypatch):
     assert memory_engine._recall_scoring_now(None) == now
 
 
+# Patches the SQL retrieval path, which a store-owned bank never takes: its recall goes to the
+# store for a bank this harness never created, so the patched arms are never reached.
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_recall_async_passes_question_date_to_combined_scoring(monkeypatch):
     question_date = datetime(2023, 5, 30, 21, 53, tzinfo=timezone(timedelta(hours=8)))

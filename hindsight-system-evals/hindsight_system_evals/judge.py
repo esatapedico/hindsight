@@ -31,10 +31,17 @@ from google.genai import types
 _CONFIRMATIONS = int(os.getenv("HINDSIGHT_EVAL_JUDGE_CONFIRMATIONS", "2"))
 _CONFIRM_TEMPERATURE = float(os.getenv("HINDSIGHT_EVAL_JUDGE_CONFIRM_TEMPERATURE", "0.5"))
 
+# Reasoning before the verdict: field order is generation order. With the verdict first, the
+# judge sometimes decided and then reasoned the opposite — a horse-farm trap was "met" by 2 of 3
+# judges whose own reasoning read "None of the observations state a horse count that was not
+# explicitly mentioned by the user", failing a correct run.
 _SYSTEM = (
     "You grade whether an answer satisfies a stated criterion. Judge ONLY the criterion "
     "given — not style, length, or anything else. Reply with a single JSON object: "
-    '{"meets_criteria": true|false, "reasoning": "<one sentence>"}. No prose outside it.'
+    '{"reasoning": "<one sentence>", "meets_criteria": true|false}, reasoning first, then the '
+    'verdict it leads to. A criterion may describe a mistake ("Some observation states X"): '
+    "meets_criteria is true only when the answer actually contains what the criterion describes, "
+    "and false when your reasoning finds it absent. No prose outside it."
 )
 
 
@@ -113,10 +120,17 @@ async def _judge_once(response: str, criteria: str, context: str | None, tempera
     return Verdict(bool(parsed.get("meets_criteria")), str(parsed.get("reasoning", "")))
 
 
-async def evaluate(response: str, criteria: str, context: str | None = None) -> Verdict:
-    """Grade ``response`` against ``criteria``, smoothing single-call judge noise."""
+async def evaluate(response: str, criteria: str, context: str | None = None, *, confirm_met: bool = False) -> Verdict:
+    """Grade ``response`` against ``criteria``, smoothing single-call judge noise.
+
+    By default a "not met" is the verdict that gets re-asked, because a failed
+    requirement is what fails a run. A *trap* criterion inverts that: there "met"
+    is the failure, so ``confirm_met=True`` re-asks a "met" instead. Smoothing the
+    wrong side turns noise into a hit — a correct "not met" overruled by two
+    lenient re-asks at higher temperature.
+    """
     primary = await _judge_once(response, criteria, context, temperature=0.0)
-    if primary.meets_criteria or _CONFIRMATIONS <= 0:
+    if primary.meets_criteria != confirm_met or _CONFIRMATIONS <= 0:
         return primary
 
     confirmations = await asyncio.gather(
@@ -126,5 +140,5 @@ async def evaluate(response: str, criteria: str, context: str | None = None) -> 
     verdicts = [primary] + [v for v in confirmations if isinstance(v, Verdict)]
     met = sum(1 for v in verdicts if v.meets_criteria)
     if met > len(verdicts) - met:
-        return Verdict(True, f"majority of {len(verdicts)} judges met the criteria (primary overruled as noise)")
-    return Verdict(False, f"{len(verdicts) - met}/{len(verdicts)} judges agree: {primary.reasoning}")
+        return Verdict(True, f"{met}/{len(verdicts)} judges met the criteria: {primary.reasoning}")
+    return Verdict(False, f"{len(verdicts) - met}/{len(verdicts)} judges did not: {primary.reasoning}")

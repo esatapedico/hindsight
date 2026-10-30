@@ -404,9 +404,10 @@ class CostReport(BaseModel):
     timestamp: str
     model: str
     fixture: str
-    #: Whether reflect built explicit per-step caches (HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED),
-    #: which changes how cached tokens are billed — see ``RefreshCost.cost``.
-    explicit_cache: bool = True
+    #: Whether reflect built explicit per-step caches, which changes how cached tokens are
+    #: billed — see ``RefreshCost.cost``. True only in reports from before that cache was
+    #: removed (it was HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED).
+    explicit_cache: bool = False
     refreshes: list[RefreshCost]
 
 
@@ -425,7 +426,11 @@ async def llm_calls(client: Hindsight, bank_id: str, since: str, until: str) -> 
     calls: list[LLMCall] = []
     offset = 0
     while True:
-        page = await api.list_llm_requests(bank_id, start_date=since, end_date=until, limit=500, offset=offset)
+        # LLM calls only: the refresh's embedding, rerank and decision calls are traced
+        # in the same table, and their input tokens are not prompt tokens to price.
+        page = await api.list_llm_requests(
+            bank_id, start_date=since, end_date=until, call_type="llm", limit=500, offset=offset
+        )
         for item in page.items:
             calls.append(
                 LLMCall(

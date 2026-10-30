@@ -27,12 +27,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from hindsight_api.engine.memories.base import MemoriesExtension
-from hindsight_api.engine.memory_engine import Budget, MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.providers.mock_llm import MockLLM
 from hindsight_api.engine.reflect.tools import tool_expand
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult
-from hindsight_api.engine.search.tags import TagGroupLeaf, TagGroupNot
-from hindsight_api.engine.source_scope import ids_passing, tag_filter_is_active, visible_document_ids
+from hindsight_api.engine.response_models import Budget, LLMToolCall, LLMToolCallResult
+from hindsight_api.engine.search.tags import TagGroupLeaf, TagGroupNot, tag_filter_active
+from hindsight_api.engine.source_scope import ids_passing, visible_document_ids
 
 # ---------------------------------------------------------------------------
 # The matcher
@@ -59,8 +59,8 @@ _DOCS = {
         ([], "exact", None, True),
     ],
 )
-def test_tag_filter_is_active(tags, match, groups, active):
-    assert tag_filter_is_active(tags, match, groups) is active
+def test_tag_filter_active(tags, match, groups, active):
+    assert tag_filter_active(tags, match, groups) is active
 
 
 @pytest.mark.parametrize(

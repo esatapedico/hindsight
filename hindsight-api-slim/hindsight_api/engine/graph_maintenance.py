@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 
 from ..models import RequestContext
 from .db.base import DatabaseConnection
+from .db_utils import acquire_with_retry
 from .schema import fq_table
 
 if TYPE_CHECKING:
@@ -214,7 +215,7 @@ async def run_graph_maintenance_job(
     config = get_config()
 
     result = JobResult()
-    job_start = time.time()
+    job_start = time.perf_counter()
     deadline = time.monotonic() + _JOB_TIME_BUDGET_SECONDS
 
     # --- Pass 1: relink ---
@@ -244,7 +245,7 @@ async def run_graph_maintenance_job(
     result.stale_cooccurrences_pruned = prune.stale_cooccurrences_pruned
     result.queues_drained = relink.queue_exhausted and prune.queue_exhausted
 
-    elapsed = time.time() - job_start
+    elapsed = time.perf_counter() - job_start
 
     # --- Hand-off: schedule a successor for any work this run leaves behind ---
     #
@@ -258,7 +259,6 @@ async def run_graph_maintenance_job(
     # after this body returns, so the row is still 'processing' now and the
     # widened predicate would otherwise dedup the hand-off against its own row and
     # silently do nothing.
-    from .memory_engine import acquire_with_retry
     from .task_backend import SyncTaskBackend
 
     if not result.queues_drained:

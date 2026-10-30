@@ -456,6 +456,9 @@ def test_empty_boosts_leave_stage2_unlogged():
     assert row.weight == pytest.approx(0.4)
 
 
+# Patches the SQL retrieval path, which a store-owned bank never takes: its recall goes to the
+# store for a bank this harness never created, so the patched arms are never reached.
+@pytest.mark.memory_backend_incompatible
 def test_recall_async_wires_stage2_and_keeps_interleave(monkeypatch):
     """recall_async really does call the stage-2 helper with the passthrough decision.
 
@@ -466,7 +469,7 @@ def test_recall_async_wires_stage2_and_keeps_interleave(monkeypatch):
     from unittest.mock import AsyncMock
 
     from hindsight_api.engine import memory_engine
-    from hindsight_api.engine.memory_engine import Budget
+    from hindsight_api.engine.response_models import Budget
     from hindsight_api.engine.search.retrieval import MultiFactTypeRetrievalResult, ParallelRetrievalResult
     from hindsight_api.engine.search.types import RetrievalResult, ScoredResult
     from hindsight_api.models import RequestContext
@@ -487,7 +490,7 @@ def test_recall_async_wires_stage2_and_keeps_interleave(monkeypatch):
         async def ensure_initialized(self) -> None:
             return None
 
-        async def rerank(self, _query: str, candidates: list[MergedCandidate]) -> RerankResult:
+        async def rerank(self, _query: str, candidates: list[MergedCandidate], now=None, **_options) -> RerankResult:
             return RerankResult(
                 results=[
                     ScoredResult(

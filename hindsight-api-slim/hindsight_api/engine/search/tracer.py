@@ -94,6 +94,7 @@ class SearchTracer:
         self.retrieval_results: list[RetrievalMethodResults] = []
         self.rrf_merged: list[RRFMergeResult] = []
         self.reranked: list[RerankedResult] = []
+        self.reranker_provider: str | None = None
 
         # Tracking state
         self.current_step = 0
@@ -101,7 +102,7 @@ class SearchTracer:
 
     def start(self):
         """Start timing the search."""
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
 
     def record_query_embedding(self, embedding: list[float]):
         """Record the query embedding."""
@@ -383,7 +384,7 @@ class SearchTracer:
         if self.start_time is None:
             raise ValueError("Tracer not started - call start() first")
 
-        total_duration = time.time() - self.start_time
+        total_duration = time.perf_counter() - self.start_time
 
         # Set final ranks on visits based on results
         for rank, result in enumerate(final_results, 1):
@@ -422,6 +423,7 @@ class SearchTracer:
             retrieval_results=self.retrieval_results,
             rrf_merged=self.rrf_merged,
             reranked=self.reranked,
+            reranker_provider=self.reranker_provider,
             entry_points=self.entry_points,
             visits=self.visits,
             summary=summary,

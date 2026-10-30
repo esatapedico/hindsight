@@ -18,19 +18,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from hindsight_api.engine.llm_interface import (
-    LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
-    LLMToolChoice,
-    LLMToolChoiceMode,
     ProviderContentPolicyError,
     ProviderRateLimitResetError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
@@ -40,12 +38,51 @@ from ..response_models import LLMCallResult
 logger = logging.getLogger(__name__)
 
 
+class _SdkUsage(BaseModel):
+    """The Anthropic-shaped usage block the CLI reports on its messages."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+
+
+def _sdk_token_usage(usage: dict[str, Any] | None, messages: list[dict[str, Any]], text: str) -> TokenUsage:
+    """Token counts from the usage block the CLI reports.
+
+    Anthropic counts cache reads and writes apart from ``input_tokens``; the
+    ``TokenUsage`` contract counts them in it, with reads also in ``cached_tokens``.
+    Falls back to a char/4 estimate when the run reported no usage.
+    """
+    if not usage:
+        estimated_input = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        estimated_output = len(text) // 4
+        return TokenUsage(
+            input_tokens=estimated_input,
+            output_tokens=estimated_output,
+            total_tokens=estimated_input + estimated_output,
+        )
+    parsed = _SdkUsage.model_validate(usage)
+    cache_read = parsed.cache_read_input_tokens or 0
+    input_tokens = (parsed.input_tokens or 0) + cache_read + (parsed.cache_creation_input_tokens or 0)
+    output_tokens = parsed.output_tokens or 0
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cached_tokens=cache_read,
+    )
+
+
 # Isolation env passed to the spawned `claude` CLI. CLAUDE_CONFIG_DIR
 # redirects the subprocess away from the host's ~/.claude/, so any
 # operator-installed plugins (e.g. hindsight-memory) and their Stop hooks do
 # not fire inside our LLM-call subprocesses. Without this, retain/reflect/
 # consolidation LLM calls would trigger a Stop-hook retain of the subprocess
 # transcript back into the same bank — a recursive feedback loop (issue #1751).
+# This only covers *user* settings: the call sites also pin cwd to this dir and
+# pass setting_sources=[], or project settings from the daemon's cwd reopen the
+# same loop (issue #5542).
 # CLAUDE_SECURESTORAGE_CONFIG_DIR="" forces the CLI's keychain service name
 # back to the canonical un-suffixed entry that `claude auth login` wrote;
 # otherwise it would be namespaced by sha256(CLAUDE_CONFIG_DIR) and OAuth
@@ -211,6 +248,14 @@ class ClaudeCodeLLM(LLMInterface):
                 "CLAUDE_CODE_OAUTH_TOKEN from config" if "CLAUDE_CODE_OAUTH_TOKEN" in self._env else "claude auth login"
             )
             logger.info(f"Claude Code: Using Claude Agent SDK (authentication via {auth})")
+            # Automated calls on a Claude subscription may conflict with Anthropic's
+            # terms; point operators at the docs notice rather than starting silently (#5444).
+            logger.warning(
+                "Claude Code provider runs automated model calls on your Claude subscription, which may "
+                "conflict with Anthropic's terms. Read the notice before using it beyond personal local "
+                "development, and prefer the 'anthropic' provider with an API key for servers: "
+                "https://hindsight.vectorize.io/developer/models#claude-code-setup-claude-promax"
+            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize Claude Code provider: {e}\n\n"
@@ -317,7 +362,7 @@ class ClaudeCodeLLM(LLMInterface):
             query,
         )
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Build system prompt
         system_prompt = ""
@@ -347,8 +392,7 @@ class ClaudeCodeLLM(LLMInterface):
 
         # Configure SDK options
         #
-        # tools=[] is required here for the same reason call_with_tools() below
-        # already sets it: with `tools` left at its default (None -> full
+        # tools=[] is required: with `tools` left at its default (None -> full
         # "claude_code" built-in preset), allowed_tools=[] alone does not stop
         # the CLI from loading the full built-in toolset and deferring into
         # ToolSearch before answering, which burns the single max_turns=1
@@ -363,11 +407,19 @@ class ClaudeCodeLLM(LLMInterface):
             # Pin the configured model (issue #2881). Without this the spawned CLI
             # runs its own default model — an Opus-class model on Pro/Max OAuth —
             # regardless of HINDSIGHT_API_*_LLM_MODEL, while metrics/logs still print
-            # self.model, so the mismatch is invisible. The isolated CLAUDE_CONFIG_DIR
-            # (fresh temp dir) means a host settings.json can't reach the CLI either,
-            # so passing it through here is the only channel.
+            # self.model, so the mismatch is invisible. The CLI loads no settings
+            # files (setting_sources=[] below), so a host settings.json can't set the
+            # model either: passing it through here is the only channel.
             model=self.model or None,
             env=self._env,
+            # CLAUDE_CONFIG_DIR only moves *user* settings. The CLI still loads
+            # ./.claude/settings.json from its cwd as project settings, and the
+            # subprocess inherits the daemon's cwd: started from $HOME, that file
+            # IS ~/.claude/settings.json with the host's hooks, and the #1751
+            # loop comes back (issue #5542). Run in the empty isolated dir and
+            # load no settings files at all.
+            cwd=self._env["CLAUDE_CONFIG_DIR"],
+            setting_sources=[],
         )
 
         # Call Claude Agent SDK
@@ -376,6 +428,7 @@ class ClaudeCodeLLM(LLMInterface):
             try:
                 # Collect streaming response
                 full_text = ""
+                sdk_usage: dict[str, Any] | None = None
 
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.claude_code.{scope}.attempt={attempt + 1}/{max_retries + 1}")
@@ -384,19 +437,23 @@ class ClaudeCodeLLM(LLMInterface):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
                                     full_text += block.text
-                        elif isinstance(message, ResultMessage) and message.is_error:
-                            # Surface the CLI's actual error text (e.g. quota
-                            # exhaustion) instead of the SDK's subtype-based
-                            # fallback exception (issue #2702).
-                            raise _result_error(message)
+                        elif isinstance(message, ResultMessage):
+                            if message.is_error:
+                                # Surface the CLI's actual error text (e.g. quota
+                                # exhaustion) instead of the SDK's subtype-based
+                                # fallback exception (issue #2702).
+                                raise _result_error(message)
+                            # The run's total usage, as the CLI billed it.
+                            sdk_usage = message.usage
 
-                # The Claude Agent SDK doesn't report exact counts; stash the same
-                # char/4 estimate the success path traces so a later parse/validate
-                # failure records consistent (estimated) tokens, not zero (#2387).
+                # Stashed before parsing so a later parse/validate failure traces
+                # the same counts the success path does (#2387).
+                token_usage = _sdk_token_usage(sdk_usage, messages, full_text)
                 stash_response_usage(
                     LLMResponseUsage(
-                        input_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
-                        output_tokens=len(full_text) // 4,
+                        input_tokens=token_usage.input_tokens,
+                        output_tokens=token_usage.output_tokens,
+                        cached_tokens=token_usage.cached_tokens,
                     )
                 )
 
@@ -414,7 +471,13 @@ class ClaudeCodeLLM(LLMInterface):
                             await asyncio.sleep(backoff)
                             last_exception = e
                             continue
-                        raise
+                        # Retry budget spent: structural repair as a last resort, as
+                        # openai_compatible_llm.py does since #3935. A quotation copied
+                        # verbatim leaves an unescaped inner '"' that every retry
+                        # reproduces (#5472). We only get here after the CLI's
+                        # ResultMessage arrived without an error, so the body is complete.
+                        # Raises JSONDecodeError again if unrecoverable.
+                        json_data = parse_llm_json(full_text)
 
                     if skip_validation:
                         result = json_data
@@ -424,22 +487,18 @@ class ClaudeCodeLLM(LLMInterface):
                     result = full_text
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
-
-                # Estimate token usage (Claude Agent SDK doesn't report exact counts)
-                # Use character count / 4 as rough estimate (1 token ≈ 4 characters)
-                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                estimated_output = len(full_text) // 4
 
                 metrics.record_llm_call(
                     provider=self.provider,
                     model=self.model,
                     scope=scope,
                     duration=duration,
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
+                    input_tokens=token_usage.input_tokens,
+                    output_tokens=token_usage.output_tokens,
                     success=True,
+                    cached_input_tokens=token_usage.cached_tokens,
                 )
 
                 # Record trace span
@@ -453,11 +512,12 @@ class ClaudeCodeLLM(LLMInterface):
                         scope=scope,
                         messages=messages,
                         response_content=_serialize_for_span(result),
-                        input_tokens=estimated_input,
-                        output_tokens=estimated_output,
+                        input_tokens=token_usage.input_tokens,
+                        output_tokens=token_usage.output_tokens,
                         duration=duration,
                         finish_reason=None,
                         error=None,
+                        cached_tokens=token_usage.cached_tokens,
                     )
                 except Exception as span_error:
                     # Tracing must remain best-effort, but expose instrumentation
@@ -470,11 +530,6 @@ class ClaudeCodeLLM(LLMInterface):
                         f"slow llm call: scope={scope}, model={self.provider}/{self.model}, time={duration:.3f}s"
                     )
 
-                token_usage = TokenUsage(
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                    total_tokens=estimated_input + estimated_output,
-                )
                 return LLMCallResult(content=result, usage=token_usage)
 
             except ValidationError:
@@ -511,296 +566,6 @@ class ClaudeCodeLLM(LLMInterface):
         if last_exception:
             raise last_exception
         raise RuntimeError("Claude Code call failed after all retries")
-
-    async def call_with_tools(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        max_completion_tokens: int | None = None,
-        temperature: float | None = None,
-        scope: str = "tools",
-        max_retries: int = 5,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> LLMToolCallResult:
-        """
-        Make an LLM API call with tool/function calling support using Claude Agent SDK.
-
-        This implementation uses ClaudeSDKClient (not query()) because custom tools via
-        SDK MCP servers are only supported with the client. Tools are converted from OpenAI
-        format to SDK MCP tools, and tool names are formatted as mcp__hindsight_tools__{name}.
-
-        Args:
-            messages: List of message dicts. Can include tool results with role='tool'.
-            tools: List of tool definitions in OpenAI format.
-            max_completion_tokens: Maximum tokens in response (not used by Claude Agent SDK).
-            temperature: Sampling temperature (not used by Claude Agent SDK).
-            scope: Scope identifier for tracking.
-            max_retries: Maximum retry attempts.
-            initial_backoff: Initial backoff time in seconds.
-            max_backoff: Maximum backoff time in seconds.
-            tool_choice: Canonical tool-selection policy.
-                - "auto": Model decides whether to call tools (default)
-                - "required": Model must call at least one tool
-                - "none": Model must not call any tools
-                - {"type": "function", "function": {"name": "..."}}: Force specific tool call
-
-        Returns:
-            LLMToolCallResult with content and/or tool_calls.
-        """
-        from claude_agent_sdk import (  # type: ignore[unresolved-import]
-            AssistantMessage,
-            ClaudeAgentOptions,
-            ClaudeSDKClient,
-            ResultMessage,
-            SdkMcpTool,
-            TextBlock,
-            ToolUseBlock,
-            create_sdk_mcp_server,
-        )
-
-        start_time = time.time()
-
-        # Convert OpenAI tool format to Claude Agent SDK SdkMcpTool format
-        sdk_tools: list[SdkMcpTool] = []
-        tool_names: list[str] = []
-
-        for tool in tools:
-            func = tool.get("function", {})
-            tool_name = func.get("name", "")
-            tool_description = func.get("description", "")
-            parameters = func.get("parameters", {})
-
-            # Create a handler with proper closure to avoid transport issues
-            def make_handler(name: str):
-                async def handler(args: dict[str, Any]) -> dict[str, Any]:
-                    # Return immediately with success - tool execution happens externally
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"[Tool {name} called successfully]",
-                            }
-                        ]
-                    }
-
-                return handler
-
-            sdk_tools.append(
-                SdkMcpTool(
-                    name=tool_name,
-                    description=tool_description,
-                    input_schema=parameters,
-                    handler=make_handler(tool_name),
-                )
-            )
-            tool_names.append(tool_name)
-
-        # Create an MCP server with the tools
-        mcp_server = create_sdk_mcp_server(
-            name="hindsight_tools",
-            version="1.0.0",
-            tools=sdk_tools if sdk_tools else None,
-        )
-
-        # Build system prompt and user content from messages
-        system_prompt = ""
-        user_content = ""
-
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-
-            if role == "system":
-                system_prompt += ("\n\n" + content) if system_prompt else content
-            elif role == "user":
-                user_content += ("\n\n" + content) if user_content else content
-            elif role == "assistant":
-                # Include previous assistant messages as context
-                user_content += f"\n\n[Previous assistant response: {content}]"
-            elif role == "tool":
-                # Tool results are already in tool_results_map, append to user context
-                tool_call_id = msg.get("tool_call_id", "")
-                user_content += f"\n\n[Tool result for {tool_call_id}: {content}]"
-
-        # Handle tool_choice parameter to filter tools and adjust instructions
-        # The Claude Agent SDK doesn't have a native tool_choice parameter, so we
-        # enforce it via allowed_tools filtering and system prompt instructions.
-
-        # Format tool names for SDK MCP servers: mcp__{server_name}__{tool_name}
-        # This is required by the Claude Agent SDK for MCP server tools
-        allowed_tool_names = [f"mcp__hindsight_tools__{name}" for name in tool_names]
-        mcp_servers_config = {"hindsight_tools": mcp_server} if sdk_tools else {}
-
-        # Process tool_choice
-        if tool_choice.mode is LLMToolChoiceMode.NAMED:
-            # Force a specific tool: filter allowed_tools to only that tool and add instruction
-            forced_name = tool_choice.selected_function_name
-            forced_tool_mcp_name = f"mcp__hindsight_tools__{forced_name}"
-            if forced_tool_mcp_name in allowed_tool_names:
-                allowed_tool_names = [forced_tool_mcp_name]
-                force_instruction = (
-                    f"\n\nIMPORTANT: You MUST call the '{forced_name}' tool. Do not respond with text only."
-                )
-                system_prompt += force_instruction
-                logger.debug(f"Claude Code: Forcing tool call to '{forced_name}'")
-            else:
-                logger.warning(f"Claude Code: Forced tool '{forced_name}' not found in available tools")
-        elif tool_choice.mode is LLMToolChoiceMode.REQUIRED:
-            # Must call at least one tool
-            tool_instruction = (
-                "\n\nIMPORTANT: You MUST call at least one of the available tools. Do not respond with text only."
-            )
-            system_prompt += tool_instruction
-            logger.debug("Claude Code: Tool call required")
-        elif tool_choice.mode is LLMToolChoiceMode.NONE:
-            # No tools should be called - disable all tools
-            allowed_tool_names = []
-            mcp_servers_config = {}
-            logger.debug("Claude Code: Tools disabled (tool_choice=none)")
-        # else: tool_choice == "auto" or unspecified - use default behavior (no changes needed)
-
-        # Configure SDK options with MCP server
-        #
-        # tools=[] disables built-in CLI tools (Read, Write, Bash, ToolSearch, etc.)
-        # Without this, Claude Code CLI defers MCP tools when too many built-in tools
-        # are loaded, forcing Claude to use ToolSearch first — which wastes the turn
-        # budget and prevents direct MCP tool calls.
-        #
-        # max_turns=1 is critical (issue #2966). call_with_tools() is one *round* of
-        # an agentic loop the caller drives: the model proposes tool calls, we return
-        # them, and the orchestrator (reflect/agent.py) executes the REAL tools and
-        # feeds the results back on the next call. The SDK, however, runs its own
-        # in-process loop: it invokes our SDK MCP handlers — which are deliberate
-        # placeholders returning "[Tool <name> called successfully]" (no real data) —
-        # and lets the model react. With max_turns >= 2 the model calls recall, sees
-        # the empty placeholder, re-queries with reworded searches, exhausts the turn
-        # budget, and the run ends in error_max_turns with its tool calls discarded —
-        # exactly the "0 tool calls / no information" failure in #2966. Capping at a
-        # single turn stops the SDK from acting on the placeholder results: the model
-        # emits its first tool call (or a text answer) and we return that to the caller
-        # unchanged, matching how every other provider's call_with_tools() behaves.
-        options = ClaudeAgentOptions(
-            system_prompt=system_prompt if system_prompt else None,
-            tools=[],  # Disable built-in tools so MCP tools load eagerly
-            max_turns=1,  # One round: propose tool calls (or answer); caller drives the loop
-            mcp_servers=mcp_servers_config,
-            allowed_tools=allowed_tool_names,
-            # Pin the configured model (issue #2881) — see the call() options block.
-            model=self.model or None,
-            env=self._env,
-        )
-
-        # Call Claude Agent SDK with retry logic
-        last_exception = None
-        for attempt in range(max_retries + 1):
-            try:
-                full_text = ""
-                tool_calls: list[LLMToolCall] = []
-
-                async with attempt_context() if attempt_context is not None else nullcontext():
-                    set_stage(f"llm.claude_code.tools.attempt={attempt + 1}/{max_retries + 1}")
-                    # Use ClaudeSDKClient for tool calling support
-                    # Note: query() does NOT support custom tools, only ClaudeSDKClient does
-                    async with ClaudeSDKClient(options=options) as client:
-                        # Send the query
-                        await client.query(user_content)
-
-                        # Receive response
-                        async for message in client.receive_response():
-                            if isinstance(message, AssistantMessage):
-                                for block in message.content:
-                                    if isinstance(block, TextBlock):
-                                        full_text += block.text
-                                    elif isinstance(block, ToolUseBlock):
-                                        # SDK returns tool names with MCP prefix (mcp__hindsight_tools__{name})
-                                        # Strip the prefix to return original tool name expected by caller
-                                        tool_name = block.name
-                                        if tool_name.startswith("mcp__hindsight_tools__"):
-                                            tool_name = tool_name.replace("mcp__hindsight_tools__", "", 1)
-
-                                        tool_calls.append(
-                                            LLMToolCall(
-                                                id=block.id,
-                                                name=tool_name,
-                                                arguments=block.input,
-                                            )
-                                        )
-                                if tool_calls:
-                                    # This round proposed tool call(s). Stop consuming the
-                                    # stream so the SDK does not run another turn against our
-                                    # placeholder handlers (issue #2966) — the caller executes
-                                    # the real tools and calls us again with the results.
-                                    break
-                            elif isinstance(message, ResultMessage) and message.is_error:
-                                # With max_turns=1 the CLI reports error_max_turns whenever
-                                # the model spent its single turn issuing a tool call (there
-                                # was no follow-up turn to emit final text). That is expected
-                                # here and not a failure: we already captured the tool call
-                                # above and break before reaching this branch. Only a genuine
-                                # error with nothing to return should surface (issue #2702).
-                                if not tool_calls:
-                                    raise _result_error(message)
-
-                # Record metrics
-                duration = time.time() - start_time
-                metrics = get_metrics_collector()
-
-                # Estimate token usage (Claude Agent SDK doesn't report exact counts)
-                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                estimated_output = len(full_text) // 4
-
-                metrics.record_llm_call(
-                    provider=self.provider,
-                    model=self.model,
-                    scope=scope,
-                    duration=duration,
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                    success=True,
-                )
-
-                # Log slow calls
-                if duration > 10.0:
-                    logger.info(
-                        f"slow llm call: scope={scope}, model={self.provider}/{self.model}, time={duration:.3f}s"
-                    )
-
-                return LLMToolCallResult(
-                    content=full_text if full_text else None,
-                    tool_calls=tool_calls,
-                    finish_reason="tool_calls" if tool_calls else "stop",
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                )
-
-            except (ProviderContentPolicyError, ProviderRateLimitResetError):
-                # Permanent refusal or subscription limit — see the same guard in call().
-                raise
-
-            except Exception as e:
-                last_exception = e
-
-                # Check for authentication errors
-                error_str = str(e).lower()
-                if "auth" in error_str or "login" in error_str or "credential" in error_str:
-                    logger.error(f"Claude Code authentication error: {e}")
-                    raise RuntimeError(f"Claude Code authentication failed: {e}\n\n{self._auth_hint}") from e
-
-                if attempt < max_retries:
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    logger.warning(f"Claude Code tool call error (attempt {attempt + 1}/{max_retries + 1}): {e}")
-                    await asyncio.sleep(backoff)
-                    continue
-                else:
-                    logger.error(f"Claude Code tool call error after {max_retries + 1} attempts: {e}")
-                    raise
-
-        if last_exception:
-            raise last_exception
-        raise RuntimeError("Claude Code tool call failed after all retries")
 
     async def cleanup(self) -> None:
         """Clean up resources (no HTTP client to close for Claude Agent SDK)."""

@@ -76,11 +76,11 @@ def test_aliases_cited_in_the_answer_become_real_ids():
     presenter.present(_observations("uuid-a", "uuid-b"))
     args = {
         "answer": "o1 contradicts o2 (see [o2]); c9 and vitamin C1 are untouched",
-        "document": {"sections": [{"heading": "o1", "level": 2, "blocks": ["o2 supersedes o1."]}]},
+        "markdown": "## o1\n\no2 supersedes o1.",
     }
     assert presenter.resolve(args) == {
         "answer": "uuid-a contradicts uuid-b (see [uuid-b]); c9 and vitamin C1 are untouched",
-        "document": {"sections": [{"heading": "uuid-a", "level": 2, "blocks": ["uuid-b supersedes uuid-a."]}]},
+        "markdown": "## uuid-a\n\nuuid-b supersedes uuid-a.",
     }
     assert presenter.resolve_text("o10 is not o1") == "o10 is not uuid-a"
 
@@ -96,7 +96,7 @@ def test_an_item_already_shown_is_referenced_not_repeated():
 def test_reading_a_page_seen_as_a_snippet_returns_its_text():
     """The dedupe keys on the shape, not the id alone.
 
-    `search_mental_models` shows the best hit whole and the rest as snippets, so
+    `search_mental_models` shows the best hits whole and the rest as snippets, so
     the SAME page id legitimately comes back twice: once truncated, once in full
     from the `read_mental_models` the model then issues. Keying on the id alone
     answered that read with `already_shown` and an empty list — the model asked

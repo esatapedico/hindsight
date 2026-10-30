@@ -50,11 +50,14 @@ class _FakeOptions:
     env: dict[str, str] = field(default_factory=dict)
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     model: str | None = None
+    cwd: str | None = None
+    setting_sources: list[str] | None = None
 
 
 class _FakeAssistantMessage:
     def __init__(self, content: list[Any]) -> None:
         self.content = content
+        self.usage = None
 
 
 class _FakeTextBlock:
@@ -67,6 +70,7 @@ class _FakeResultMessage:
         self.subtype = subtype
         self.is_error = is_error
         self.result = result
+        self.usage = None
 
 
 def _instantiate_provider():
@@ -223,67 +227,6 @@ async def test_call_survives_span_recorder_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_call_with_tools_raises_with_result_text_on_error_result(monkeypatch):
-    """call_with_tools() must surface ResultMessage.result the same way."""
-    import claude_agent_sdk
-
-    class _FakeClient:
-        def __init__(self, options: _FakeOptions) -> None:
-            self.options = options
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def query(self, prompt: str) -> None:
-            return None
-
-        async def receive_response(self):
-            yield _FakeResultMessage(subtype="success", is_error=True, result=QUOTA_ERROR_TEXT)
-
-    @dataclass
-    class _FakeSdkMcpTool:
-        name: str
-        description: str
-        input_schema: dict[str, Any]
-        handler: Any
-
-    def fake_create_sdk_mcp_server(name: str, version: str, tools=None):
-        return {"name": name, "version": version, "tools": tools}
-
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeAgentOptions", _FakeOptions)
-    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
-    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
-    monkeypatch.setattr(claude_agent_sdk, "ResultMessage", _FakeResultMessage)
-    monkeypatch.setattr(claude_agent_sdk, "ToolUseBlock", type("ToolUseBlock", (), {}))
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", _FakeClient)
-    monkeypatch.setattr(claude_agent_sdk, "SdkMcpTool", _FakeSdkMcpTool)
-    monkeypatch.setattr(claude_agent_sdk, "create_sdk_mcp_server", fake_create_sdk_mcp_server)
-
-    provider = _instantiate_provider()
-    with pytest.raises(ProviderRateLimitResetError) as excinfo:
-        await provider.call_with_tools(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[
-                {
-                    "function": {
-                        "name": "noop",
-                        "description": "no-op",
-                        "parameters": {"type": "object", "properties": {}},
-                    }
-                }
-            ],
-            max_retries=2,
-            scope="test",
-        )
-
-    assert QUOTA_ERROR_TEXT in str(excinfo.value)
-    assert excinfo.value.retry_at > datetime.now(UTC)
-
-
-@pytest.mark.asyncio
 async def test_call_keeps_a_fence_marker_inside_a_json_value(monkeypatch):
     """A ``` inside a string value must not cut the payload short (#4819)."""
     import claude_agent_sdk
@@ -356,3 +299,67 @@ async def test_call_turns_a_subscription_limit_into_a_reset_time(monkeypatch):
 )
 def test_limit_reset_at(text, expected):
     assert _limit_reset_at(text, datetime(2026, 10, 3, 22, 10, tzinfo=UTC)) == expected
+
+
+@pytest.mark.asyncio
+async def test_call_repairs_an_unescaped_quote_once_retries_are_spent(monkeypatch):
+    """A quotation copied verbatim repeats on every retry; the last attempt repairs it (#5472)."""
+    import claude_agent_sdk
+
+    broken = '{"fact": "He said the intuition "one spec at a time" was right"}'
+
+    async def fake_query(prompt: str, options: _FakeOptions):
+        yield _FakeAssistantMessage(content=[_FakeTextBlock(text=broken)])
+        yield _FakeResultMessage(subtype="success", is_error=False, result=broken)
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeAgentOptions", _FakeOptions)
+    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
+    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
+    monkeypatch.setattr(claude_agent_sdk, "ResultMessage", _FakeResultMessage)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+    result = (
+        await _instantiate_provider().call(
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_format=_StructuredResponse,
+            max_retries=0,
+            scope="retain_extract_facts",
+        )
+    ).content
+
+    assert result.fact == 'He said the intuition "one spec at a time" was right'
+
+
+def test_startup_warns_about_subscription_terms(caplog):
+    """Starting the provider points operators at the Terms of Service notice (#5444)."""
+    with caplog.at_level("WARNING", logger="hindsight_api.engine.providers.claude_code_llm"):
+        _instantiate_provider()
+    assert any("Anthropic's terms" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_call_reports_usage_from_result_message(monkeypatch):
+    """call() reports the CLI's billed usage, cache reads and writes counted as input (#5541)."""
+    import claude_agent_sdk
+
+    result_message = _FakeResultMessage(subtype="success", is_error=False, result="ok")
+    result_message.usage = {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 200,
+        "output_tokens": 30,
+    }
+
+    async def fake_query(prompt: str, options: _FakeOptions):
+        yield _FakeAssistantMessage(content=[_FakeTextBlock(text="ok")])
+        yield result_message
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeAgentOptions", _FakeOptions)
+    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
+    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
+    monkeypatch.setattr(claude_agent_sdk, "ResultMessage", _FakeResultMessage)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+    usage = (await _instantiate_provider().call(messages=[{"role": "user", "content": "hi"}], max_retries=0)).usage
+
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens, usage.cached_tokens) == (1210, 30, 1240, 1000)

@@ -515,6 +515,17 @@ def _render_reflect(
     if config.reflect_mission:
         profile["mission"] = config.reflect_mission
 
+    # The same rule the engine applies: a System One decision model the bank keeps on takes the
+    # free turn's done as the answer; otherwise the closing step writes it, and the model
+    # signals it is ready with answer_ready (#5832).
+    from ..config import SYSTEM_ONE_DECISION_MODEL_PROVIDERS
+
+    decision_setup = config.decision_model_config("reflect")
+    decision_orchestrated = (
+        config.reflect_use_decision_model
+        and decision_setup is not None
+        and decision_setup.provider in SYSTEM_ONE_DECISION_MODEL_PROVIDERS
+    )
     system_prompt = build_system_prompt_for_tools(
         profile,
         None,
@@ -523,8 +534,10 @@ def _render_reflect(
         include_observations=PREVIEW_REFLECT_INCLUDE_OBSERVATIONS,
         budget=None,
         llm_output_language=config.llm_output_language,
+        answer_ready=not decision_orchestrated,
     )
-    user_prompt = build_agent_user_prompt(PLACEHOLDER_REFLECT_QUERY, config.llm_output_language)
+    mission = (profile.get("mission") or "").strip()
+    user_prompt = build_agent_user_prompt(PLACEHOLDER_REFLECT_QUERY, config.llm_output_language, mission)
 
     # The identity head is the bank's own name and disposition traits, so it reads as
     # hardcoded prompt text unless it is called out. Both lines come from the prompt
@@ -541,13 +554,18 @@ def _render_reflect(
             build_directives_section(directives).strip() if directives else "",
             active=bool(directives),
         ),
-        _setting("reflect_mission", (profile.get("mission") or "").strip(), value=config.reflect_mission),
+        _setting("reflect_mission", mission, value=config.reflect_mission),
         *_language_blocks(config, _TOOLS_LANGUAGE_RULE),
+    ]
+    # The mission is restated after the question too (see build_agent_user_prompt).
+    user_pieces = [
+        _setting("reflect_mission", mission, value=config.reflect_mission),
+        *_language_blocks(config, ""),
     ]
     return PromptPreview(
         messages=[
             PromptMessage(role="system", blocks=_partition(system_prompt, system_pieces)),
-            PromptMessage(role="user", blocks=_partition(user_prompt, _language_blocks(config, ""))),
+            PromptMessage(role="user", blocks=_partition(user_prompt, user_pieces)),
         ],
     )
 
