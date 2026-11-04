@@ -596,6 +596,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        # Cooperative cancellation: set by shutdown() before the client is closed so a
+        # still-running prefetch whose request the close aborts is logged once at INFO
+        # instead of WARNING (a teardown artefact, not a server failure). Cleared by
+        # every queue_prefetch() so a reused provider starts un-cancelled.
+        self._prefetch_cancel = threading.Event()
         # Bumped by every new prefetch, session switch and shutdown: a worker writes its result
         # only if no newer one started since, so a slow recall can't overwrite a fresher one or
         # land in the next session.
@@ -1012,15 +1017,19 @@ class HindsightMemoryProvider(MemoryProvider):
         return _run_sync(coro, timeout=self._timeout)
 
     def _run_hindsight_operation(self, operation):
-        """Run an async client operation; for local_embedded, a stale-daemon
-        connection failure recreates the client and retries once."""
+        """Run an async client operation; a stale-connection failure recreates the
+        client and retries once, in any mode. Never retried while tearing down: a
+        request aborted by shutdown's own client close must surface as-is so the
+        prefetch cancel path can quiet it."""
         try:
             return self._run_sync(operation(self._get_client()))
         except Exception as exc:
-            text = f"{type(exc).__name__}: {exc}".lower()
-            if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
+            if self._prefetch_cancel.is_set() or self._shutting_down.is_set():
                 raise
-            logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
+            text = f"{type(exc).__name__}: {exc}".lower()
+            if not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
+                raise
+            logger.info("Hindsight server appears unreachable; recreating client and retrying once: %s", exc)
             with self._client_lock:
                 stale, self._client = self._client, None
             if stale is not None:
@@ -1784,6 +1793,12 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
+            if self._prefetch_cancel.is_set():
+                # Shutdown closed the shared client under this still-running recall, so
+                # the aborted request surfaces here (e.g. ServerDisconnectedError). The
+                # result is unwanted anyway: one INFO line, no traceback.
+                logger.info("Hindsight prefetch cancelled at shutdown; result discarded")
+                return "", 0
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
 
@@ -1875,12 +1890,19 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def _join_prefetch(self, timeout: float, *, log: bool = False) -> None:
-        if not (self._prefetch_thread and self._prefetch_thread.is_alive()):
-            return
+    def _join_prefetch(self, timeout: float, *, log: bool = False) -> bool:
+        """Join the background prefetch thread -> True when it finished within
+        *timeout*, False when it is still alive (or there was no thread). Callers
+        that only need the wait keep ignoring the return value."""
+        thread = self._prefetch_thread
+        if thread is None:
+            return False
+        if not thread.is_alive():
+            return True
         if log:
             logger.debug("Prefetch: waiting for background thread to complete")
-        self._prefetch_thread.join(timeout=timeout)
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # Opt-in: recall synchronously against the *current* message so the
@@ -1902,6 +1924,9 @@ class HindsightMemoryProvider(MemoryProvider):
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        # A reused provider starts un-cancelled: shutdown() leaves the flag set, and
+        # without this a new prefetch's failure would be mistaken for teardown noise.
+        self._prefetch_cancel.clear()
         # Sync mode recalls live each turn — nothing to prime in the background.
         if self._recall_sync or self._recall_disabled():
             return
@@ -2371,6 +2396,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._join_prefetch(5.0)
         with self._prefetch_lock:
             self._prefetch_generation += 1
+        # From here a prefetch result is unwanted: mark it before _close_client() so
+        # the still-running request the close aborts is logged at INFO, not WARNING.
+        self._prefetch_cancel.set()
         if self._atexit_registered:
             # The hook holds this provider alive until exit; the gateway makes one per chat session.
             atexit.unregister(self._atexit_shutdown)
