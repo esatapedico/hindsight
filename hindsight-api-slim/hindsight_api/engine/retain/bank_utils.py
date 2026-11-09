@@ -5,7 +5,6 @@ bank profile utilities for disposition and mission management.
 import asyncio
 import json
 import logging
-import unicodedata
 import uuid
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from ..._vector_index import index_using_clause, per_bank_indexes_are_eager, use
 from ...config import get_config
 from ...schema_context import get_current_schema
 from ..db_utils import acquire_with_retry, retry_with_backoff
-from ..response_models import DispositionTraits
+from ..response_models import DispositionTraits, id_problem
 from ..schema import fq_table
 
 if TYPE_CHECKING:
@@ -333,24 +332,13 @@ async def get_bank_profile_if_exists(pool, bank_id: str) -> BankProfile | None:
     )
 
 
-# Bytes, not characters: storage keys percent-encode the bank id (up to 3x per UTF-8 byte), so
-# 192 bytes is at most 576 encoded bytes, under S3's 1,024-byte key limit with room for the
-# tenant, the prefix and the file name, while still fitting 64 CJK characters (#4391).
-BANK_ID_MAX_BYTES = 192
-
-
 def validate_new_bank_id(bank_id: str) -> None:
     """Reject a bank id that must not be created. Existing banks are never re-checked."""
     from hindsight_api.extensions import OperationValidationError
 
-    if not bank_id:
-        raise OperationValidationError("Bank id must not be empty", status_code=400)
-    if len(bank_id.encode("utf-8")) > BANK_ID_MAX_BYTES:
-        raise OperationValidationError(
-            f"Bank id is too long: at most {BANK_ID_MAX_BYTES} bytes of UTF-8 are allowed", status_code=400
-        )
-    if any(unicodedata.category(ch) == "Cc" for ch in bank_id):
-        raise OperationValidationError("Bank id must not contain control characters", status_code=400)
+    problem = id_problem(bank_id, "Bank id")
+    if problem:
+        raise OperationValidationError(problem, status_code=400)
     # Reserved so a store-owned backend can keep its own bookkeeping objects (`_index`, `_meta`, ...)
     # next to a bank's objects without escaping bank names. Existing banks are not re-checked.
     if bank_id.startswith("_"):
@@ -383,10 +371,7 @@ async def create_bank_row_on_conn(conn: "DatabaseConnection", bank_id: str, *, o
     # common "bank exists" case pays nothing.
     from .. import bank_aliases
 
-    if await bank_aliases.alias_exists_on_conn(conn, bank_id):
-        from hindsight_api.extensions import OperationValidationError
-
-        raise OperationValidationError(f"'{bank_id}' is an alias of another bank", status_code=409)
+    await bank_aliases.refuse_alias_as_bank_id_on_conn(conn, bank_id)
 
     internal_id = uuid.uuid4()
     inserted = await conn.fetchval(
@@ -552,104 +537,6 @@ async def set_bank_mission(pool, bank_id: str, mission: str) -> None:
     from .. import bank_info_cache
 
     await bank_info_cache.invalidate(bank_id, "profile")
-
-
-async def merge_bank_mission(pool, llm_config, bank_id: str, new_info: str) -> dict:
-    """
-    Merge new mission information with existing mission using LLM.
-    Normalizes to first person ("I") and resolves conflicts.
-
-    Args:
-        pool: Database connection pool
-        llm_config: LLM configuration for mission merging
-        bank_id: bank IDentifier
-        new_info: New mission information to add/merge
-
-    Returns:
-        Dict with 'mission' (str) key
-    """
-    # Get current profile
-    profile = await get_bank_profile(pool, bank_id)
-    current_mission = profile["mission"]
-
-    # Use LLM to merge missions
-    result = await _llm_merge_mission(llm_config, current_mission, new_info)
-
-    merged_mission = result["mission"]
-
-    # Update in database
-    async with acquire_with_retry(pool) as conn:
-        await conn.execute(
-            f"""
-            UPDATE {fq_table("banks")}
-            SET mission = $2,
-                updated_at = NOW()
-            WHERE bank_id = $1
-            """,
-            bank_id,
-            merged_mission,
-        )
-
-    # The profile row just changed; the next read must not serve the entry loaded before it.
-    from .. import bank_info_cache
-
-    await bank_info_cache.invalidate(bank_id, "profile")
-
-    return {"mission": merged_mission}
-
-
-async def _llm_merge_mission(llm_config, current: str, new_info: str) -> dict:
-    """
-    Use LLM to intelligently merge mission information.
-
-    Args:
-        llm_config: LLM configuration to use
-        current: Current mission text
-        new_info: New information to merge
-
-    Returns:
-        Dict with 'mission' (str) key
-    """
-    prompt = f"""You are helping maintain an agent's mission statement.
-
-Current mission: {current if current else "(empty)"}
-
-New information to add: {new_info}
-
-Instructions:
-1. Merge the new information with the current mission
-2. If there are conflicts, the NEW information overwrites the old
-3. Keep additions that don't conflict
-4. Output in FIRST PERSON ("I") perspective
-5. Be concise - keep it under 500 characters
-6. Return ONLY the merged mission text, no explanations
-
-Merged mission:"""
-
-    try:
-        messages = [{"role": "user", "content": prompt}]
-
-        call_result = await llm_config.call(
-            messages=messages, scope="bank_mission", temperature=0.3, max_completion_tokens=8192
-        )
-        content = call_result.content
-
-        logger.info(f"LLM response for mission merge (first 500 chars): {content[:500]}")
-
-        merged = content.strip()
-        if not merged or merged.lower() in ["(empty)", "none", "n/a"]:
-            merged = new_info if new_info else ""
-        return {"mission": merged}
-
-    except Exception as e:
-        logger.error(f"Error merging mission with LLM: {e}")
-        # Fallback: just append new info
-        if current:
-            merged = f"{current} {new_info}".strip()
-        else:
-            merged = new_info
-
-        return {"mission": merged}
 
 
 # Sort floor for banks that have never been written to and carry no created_at.

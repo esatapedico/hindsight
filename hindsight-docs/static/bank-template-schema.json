@@ -492,7 +492,7 @@
             }
           ],
           "default": null,
-          "description": "Default reflect options for this bank (e.g. {\"reflect_search_observations_max_tokens\": 3000, \"reflect_search_observations_include_entities\": false}). Applied to every reflect in the bank -- API, MCP and mental-model refresh -- whenever the request (or the model's trigger) leaves the option unset.",
+          "description": "Default reflect options for this bank (e.g. {\"reflect_search_observations_max_tokens\": 3000, \"reflect_search_observations_include_entities\": false}). Applied to every reflect request in the bank (API and MCP) that leaves the option unset. Mental-model refreshes do not read it: they take these options from their own trigger, defaulted per bank by knowledge_page_default_trigger.",
           "title": "Reflect Default Options"
         },
         "mental_model_min_refresh_interval_seconds": {
@@ -666,6 +666,19 @@
           "description": "Persist raw source text (documents.original_text / chunks.chunk_text). Set false to keep only derived facts.",
           "title": "Store Document Text"
         },
+        "default_timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.",
+          "title": "Default Timezone"
+        },
         "enable_auto_consolidation": {
           "anyOf": [
             {
@@ -689,7 +702,7 @@
             }
           ],
           "default": null,
-          "description": "When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call",
+          "description": "When the server has a decision model, consolidation lets it settle restatements and chatter before the LLM call",
           "title": "Consolidation Use Decision Model"
         },
         "consolidation_max_memories_per_round": {
@@ -830,6 +843,8 @@
         "priority": {
           "default": 0,
           "description": "Higher priority directives are injected first",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
           "title": "Priority",
           "type": "integer"
         },
@@ -860,7 +875,7 @@
       "description": "A mental model definition within a bank template manifest.",
       "properties": {
         "id": {
-          "description": "Unique ID for the mental model (alphanumeric lowercase with hyphens)",
+          "description": "Unique ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters)",
           "title": "Id",
           "type": "string"
         },

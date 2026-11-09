@@ -24,7 +24,14 @@ from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usag
 from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.remote_retry import jittered_backoff
-from hindsight_api.engine.response_models import TokenUsage
+from hindsight_api.engine.response_models import (
+    BatchRequest,
+    BatchRequestCounts,
+    BatchResult,
+    BatchStatus,
+    BatchSubmission,
+    TokenUsage,
+)
 from hindsight_api.engine.structured_output import _SUBSCHEMA_NAME_MAPS, provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.provider_auth import requires_api_key
@@ -117,19 +124,30 @@ _EPHEMERAL_CACHE = {"type": "ephemeral"}
 _DEFAULT_MAX_TOKENS = 64000
 
 
-def _cached_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
-    """Render the system prompt as a block list with a cache_control marker.
+def _cached_system_blocks(system_prompt: str | None, schema_msg: str | None = None) -> list[dict[str, Any]]:
+    """Render the system prompt as a block list with cache_control markers.
 
-    Anthropic prompt caching is a prefix match: marking the (single) system
-    block caches tools + system together. The system prompt is stable per
-    scope — fact extraction reuses it across every chunk, reflect and
-    consolidation keep their stable instructions there — so repeat calls read
-    it at ~10% of the base input price. Markers below the model's minimum
-    cacheable prefix are silently ignored (no write premium), so marking is
-    safe unconditionally. This is the "inline-marker provider" strategy that
+    Anthropic prompt caching is a prefix match: marking the system block
+    caches tools + system together. The system prompt is stable per scope —
+    fact extraction reuses it across every chunk, reflect and consolidation
+    keep their stable instructions there — so repeat calls read it at ~10% of
+    the base input price. Markers below the model's minimum cacheable prefix
+    are silently ignored (no write premium), so marking is safe
+    unconditionally. This is the "inline-marker provider" strategy that
     ``LLMInterface.get_or_create_cached_prefix`` documents for Anthropic.
+
+    A prompt-injected response schema goes in its own second block and
+    marker rather than being appended to the first: consolidation builds its
+    schema per batch (it enumerates the batch's fact ids), and an appended
+    schema changed the cached prefix on every call, so the stable
+    instructions in front of it were never read back (#6187). A fixed schema
+    still caches through the second marker. 2 of the 4 allowed breakpoints.
     """
-    return [{"type": "text", "text": system_prompt, "cache_control": _EPHEMERAL_CACHE}]
+    return [
+        {"type": "text", "text": text, "cache_control": _EPHEMERAL_CACHE}
+        for text in (system_prompt, schema_msg)
+        if text
+    ]
 
 
 #: ``data:<media type>;base64,<payload>`` — the OpenAI-style image part's URL form.
@@ -362,6 +380,7 @@ class AnthropicLLM(LLMInterface):
         # now (see providers/tools_via_schema.py). Without strict_schema, or on an endpoint
         # that does not take output_config, the schema goes in the prompt and the reply is parsed.
         schema = None
+        schema_msg = None
         use_native_format = False
         if response_format is not None and hasattr(response_format, "model_json_schema"):
             if strict_schema and not self._output_format_rejected:
@@ -369,8 +388,7 @@ class AnthropicLLM(LLMInterface):
                 schema = _for_native_output(strict_json_schema(response_format))
             else:
                 schema = provider_json_schema(response_format)
-                schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}"
-                system_prompt = (system_prompt + schema_msg) if system_prompt else schema_msg
+                schema_msg = f"You must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}"
 
         # Prepare parameters
         call_params: dict[str, Any] = {
@@ -379,10 +397,11 @@ class AnthropicLLM(LLMInterface):
             "max_tokens": max_completion_tokens if max_completion_tokens is not None else _DEFAULT_MAX_TOKENS,
         }
 
-        if system_prompt:
+        if system_prompt or schema_msg:
             # One-shot calls share only the system prompt with each other, so
-            # that is the sole cache breakpoint on this path.
-            call_params["system"] = _cached_system_blocks(system_prompt)
+            # it is the cache breakpoint on this path; a prompt-injected schema
+            # gets its own, so a per-request schema can't break the first.
+            call_params["system"] = _cached_system_blocks(system_prompt, schema_msg)
 
         if use_native_format:
             call_params["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
@@ -591,10 +610,10 @@ class AnthropicLLM(LLMInterface):
         it either — current Claude models reject non-default sampling params);
         an OpenAI ``response_format`` json_schema becomes ``output_config`` when strict
         (native structured output, issue #1002), else the schema is injected into the
-        system prompt.
+        system prompt (as its own system block, see ``_cached_system_blocks``).
 
-        The system prompt carries the same cache_control marker as the sync
-        one-shot path (its sole breakpoint): every request in a retain batch
+        The system prompt carries the same cache_control markers as the sync
+        one-shot path (system only, nothing on messages): every request in a retain batch
         shares the fact-extraction system prompt, so the first item's cache
         write serves the remaining items as best-effort reads — and the
         cache-read discount stacks with the 50% batch discount.
@@ -617,17 +636,17 @@ class AnthropicLLM(LLMInterface):
 
         json_schema = (body.get("response_format") or {}).get("json_schema") or {}
         schema = json_schema.get("schema")
+        schema_msg = None
         if schema is not None:
             if json_schema.get("strict"):
                 params["output_config"] = {"format": {"type": "json_schema", "schema": _for_native_output(schema)}}
             else:
-                schema_msg = "\n\nYou must respond with valid JSON matching this schema:\n" + json.dumps(
+                schema_msg = "You must respond with valid JSON matching this schema:\n" + json.dumps(
                     schema, indent=2, ensure_ascii=False
                 )
-                system_prompt = (system_prompt + schema_msg) if system_prompt else schema_msg
 
-        if system_prompt:
-            params["system"] = _cached_system_blocks(system_prompt)
+        if system_prompt or schema_msg:
+            params["system"] = _cached_system_blocks(system_prompt, schema_msg)
 
         # Batch params ARE the raw Messages body, so operator-configured extra
         # body params merge directly (the sync path routes them through the
@@ -637,52 +656,25 @@ class AnthropicLLM(LLMInterface):
 
         return params
 
-    def _translate_batch_message(self, message: Any) -> dict[str, Any]:
-        """Render an Anthropic Message as the OpenAI response body the engine parses.
-
-        The engine reads ``choices[0].message.content`` (json.loads'ing it when
-        a schema was requested) and sums ``usage`` under the OpenAI key names.
-        """
-        content = "".join(block.text for block in message.content if block.type == "text")
-
+    @staticmethod
+    def _translate_batch_message(custom_id: str, message: Any) -> BatchResult:
+        """An Anthropic Message from a succeeded batch entry as a BatchResult."""
         usage = _usage_from_anthropic_response(message)
-        input_tokens = usage.input_tokens
-        output_tokens = usage.output_tokens
-        cached_tokens = usage.cached_tokens
+        return BatchResult(
+            custom_id=custom_id,
+            content="".join(block.text for block in message.content if block.type == "text"),
+            usage=TokenUsage(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                total_tokens=usage.input_tokens + usage.output_tokens,
+                cached_tokens=usage.cached_tokens,
+            ),
+        )
 
-        return {
-            "choices": [
-                {
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": getattr(message, "stop_reason", None),
-                }
-            ],
-            "usage": {
-                "prompt_tokens": input_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-                "prompt_tokens_details": {"cached_tokens": cached_tokens},
-            },
-        }
-
-    async def submit_batch(
-        self,
-        requests: list[dict[str, Any]],
-        endpoint: str = "/v1/chat/completions",
-        completion_window: str = "24h",
-    ) -> dict[str, Any]:
-        """Submit a batch of requests to the Message Batches API.
-
-        Accepts the engine's OpenAI-JSONL-shaped entries. ``endpoint`` and
-        ``completion_window`` belong to that shared shape and have no Anthropic
-        equivalent (batches always resolve within 24 hours); both are ignored.
-        """
+    async def submit_batch(self, requests: list[BatchRequest]) -> BatchSubmission:
+        """Submit a batch of requests to the Message Batches API."""
         batch_requests = [
-            {
-                "custom_id": req["custom_id"],
-                "params": self._translate_batch_body(req.get("body") or {}),
-            }
-            for req in requests
+            {"custom_id": req.custom_id, "params": self._translate_batch_body(req.body)} for req in requests
         ]
 
         logger.info(f"Submitting Anthropic message batch with {len(batch_requests)} requests")
@@ -691,14 +683,9 @@ class AnthropicLLM(LLMInterface):
         batch = await self._client.messages.batches.create(requests=cast("list", batch_requests))
         logger.info(f"Anthropic batch submitted: {batch.id}, status={batch.processing_status}")
 
-        return {
-            "batch_id": batch.id,
-            "status": self._map_batch_status(batch.processing_status),
-            "created_at": batch.created_at,
-            "request_count": len(batch_requests),
-        }
+        return BatchSubmission(batch_id=batch.id, status=self._map_batch_status(batch.processing_status))
 
-    async def get_batch_status(self, batch_id: str) -> dict[str, Any]:
+    async def get_batch_status(self, batch_id: str) -> BatchStatus:
         """Get batch status in the shape the engine's poll loop expects."""
         batch = await self._client.messages.batches.retrieve(batch_id)
 
@@ -710,52 +697,31 @@ class AnthropicLLM(LLMInterface):
         expired = getattr(counts, "expired", 0) or 0
         resolved = succeeded + errored + canceled + expired
 
-        result: dict[str, Any] = {
-            "batch_id": batch.id,
-            "status": self._map_batch_status(batch.processing_status),
-            "created_at": batch.created_at,
-            "request_counts": {
-                "total": processing + resolved,
-                "completed": resolved,
-                "failed": errored,
-            },
-        }
+        return BatchStatus(
+            batch_id=batch.id,
+            status=self._map_batch_status(batch.processing_status),
+            request_counts=BatchRequestCounts(total=processing + resolved, completed=resolved, failed=errored),
+        )
 
-        ended_at = getattr(batch, "ended_at", None)
-        if ended_at:
-            result["completed_at"] = ended_at
-
-        return result
-
-    async def retrieve_batch_results(self, batch_id: str) -> list[dict[str, Any]]:
-        """Retrieve completed batch results, translated to the OpenAI shape.
-
-        Succeeded entries become ``{"custom_id", "response": {"body": ...}}``;
-        errored/canceled/expired entries become ``{"custom_id", "error": ...}``
-        so the engine's per-result error handling applies unchanged.
-        """
+    async def retrieve_batch_results(self, batch_id: str) -> list[BatchResult]:
+        """Retrieve completed batch results; errored/canceled/expired entries carry ``error``."""
         batch = await self._client.messages.batches.retrieve(batch_id)
         if batch.processing_status != "ended":
             raise ValueError(f"Batch {batch_id} is not completed yet (status: {batch.processing_status})")
 
         decoder = await self._client.messages.batches.results(batch_id)
-        results: list[dict[str, Any]] = []
+        results: list[BatchResult] = []
         async for entry in decoder:
             outcome = entry.result
             if outcome.type == "succeeded":
-                results.append(
-                    {
-                        "custom_id": entry.custom_id,
-                        "response": {"body": self._translate_batch_message(outcome.message)},
-                    }
-                )
+                results.append(self._translate_batch_message(entry.custom_id, outcome.message))
             else:
                 error = getattr(outcome, "error", None)
                 if error is not None:
                     detail = f"{getattr(error, 'type', 'error')}: {getattr(error, 'message', error)}"
                 else:
                     detail = f"batch request {outcome.type}"
-                results.append({"custom_id": entry.custom_id, "error": detail})
+                results.append(BatchResult(custom_id=entry.custom_id, error=detail))
 
         logger.info(f"Retrieved {len(results)} results for Anthropic batch {batch_id}")
         return results

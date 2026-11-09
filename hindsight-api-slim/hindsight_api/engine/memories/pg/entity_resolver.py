@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,7 +19,7 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any, Final, cast
 
-from ...db_utils import acquire_with_retry
+from ...db_utils import acquire_with_retry, use_or_acquire
 from ...retain.entity_labels import (
     build_labels_lookup as _build_labels_lookup_from_config,
 )
@@ -522,13 +522,38 @@ class EntityResolver:
         self._pending_stats.pop(key, None)
         self._pending_cooccurrences.pop(key, None)
 
-    async def flush_pending_stats(self) -> None:
+    def forget_pending_mentions(self, entity_ids: list[str]) -> None:
+        """Un-queue one mention-count increment per id in ``entity_ids``, for the current task.
+
+        For mentions resolved and then dropped before writing (their facts were already stored by
+        a concurrent retain of the same content), so the mentions are not counted twice. Which of
+        an entity's stats goes only matters for its date, and the dropped facts carry the same
+        dates as the copies already stored.
+        """
+        pending = self._pending_stats.get(self._task_key())
+        if not pending:
+            return
+        left = Counter(entity_ids)
+        kept: list[_EntityStat] = []
+        for stat in pending:
+            if left[stat.entity_id] > 0:
+                left[stat.entity_id] -= 1
+            else:
+                kept.append(stat)
+        pending[:] = kept
+
+    async def flush_pending_stats(self, conn: Any | None = None) -> None:
         """
         Flush accumulated entity stats and co-occurrence counts for the current task.
 
         Must be called AFTER the retain transaction commits.  Pops only the items
         accumulated by the calling asyncio task so concurrent retain batches never
         flush each other's uncommitted entity IDs.
+
+        ``conn`` runs the flush inside the caller's transaction instead. A memory
+        edit does that: its credit must commit with the postings it counts, or a
+        second edit waiting on the memory would release those postings before
+        the credit landed, floor the count at zero, and leave it one high (#6229).
         """
         if self.pool is None:
             return
@@ -540,7 +565,7 @@ class EntityResolver:
         if not stats and not cooccurrences:
             return
 
-        async with acquire_with_retry(self.pool) as conn:
+        async with use_or_acquire(self.pool, conn) as conn:
             if stats:
                 # Aggregate: sum counts and find max date per entity_id.
                 agg: dict[str, _EntityStatAgg] = defaultdict(_EntityStatAgg)

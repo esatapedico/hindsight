@@ -179,6 +179,8 @@ export interface LLMRequestsResponse {
   limit: number;
   offset: number;
   items: LLMRequestEntry[];
+  /** Days of LLM requests the server keeps; null = kept forever. */
+  retention_days?: number | null;
 }
 
 export interface LLMRequestTokenSums {
@@ -191,11 +193,16 @@ export interface LLMRequestTokenSums {
   total: number;
 }
 
+/** Column the stats can be split by, one chart line per value. */
+export type LLMStatsSplit = "model" | "operation";
+
 export interface LLMRequestStatsBucket {
   time: string;
   statuses: Record<string, number>;
   total: number;
   tokens: LLMRequestTokenSums;
+  /** Only with split_by: calls and tokens per model or operation. */
+  series?: Record<string, { calls: number; tokens: number }> | null;
 }
 
 export interface LLMRequestStatsResponse {
@@ -204,6 +211,8 @@ export interface LLMRequestStatsResponse {
   trunc: string;
   start: string;
   buckets: LLMRequestStatsBucket[];
+  /** Days of LLM requests the server keeps; null = kept forever. */
+  retention_days?: number | null;
 }
 
 /**
@@ -318,6 +327,7 @@ export type RefreshFailureReason =
   | "delta_ops_all_skipped"
   | "delta_not_applied"
   | "structured_output_failed"
+  | "candidate_rejected"
   | "retrieval_failed"
   | "no_answer"
   | "unexpected_error";
@@ -1139,6 +1149,8 @@ export class ControlPlaneClient {
     bankId: string,
     update: {
       tags?: string[];
+      add_tags?: string[];
+      remove_tags?: string[];
       observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
     }
   ) {
@@ -2580,12 +2592,18 @@ export class ControlPlaneClient {
 
   async getLLMRequestStats(
     bankId: string,
-    options?: { operation?: string; call_type?: LLMCallType; period?: string }
+    options?: {
+      operation?: string;
+      call_type?: LLMCallType;
+      period?: string;
+      split_by?: LLMStatsSplit;
+    }
   ): Promise<LLMRequestStatsResponse> {
     const params = new URLSearchParams();
     if (options?.operation) params.append("operation", options.operation);
     if (options?.call_type) params.append("call_type", options.call_type);
     if (options?.period) params.append("period", options.period);
+    if (options?.split_by) params.append("split_by", options.split_by);
     const query = params.toString();
     return this.fetchApi<LLMRequestStatsResponse>(
       bankApi(bankId, `/llm-requests/stats${query ? `?${query}` : ""}`)

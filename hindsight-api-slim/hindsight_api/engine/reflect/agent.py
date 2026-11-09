@@ -1900,9 +1900,19 @@ def _hide_lower_layers(tool_calls: list["LLMToolCall"], tool_results: list[Any])
 
 
 def _evidence_line(item: dict[str, Any]) -> str:
-    """One fact or observation as the decision model reads it: its date, then its text."""
-    when = item.get("occurred_start") or item.get("mentioned_at")
-    return f"[{when}] {item.get('text', '')}" if when else str(item.get("text", ""))
+    """One fact, observation or chunk as the decision model reads it: its dates, then its text.
+
+    Both kinds of date: when it happened and when it was said. "Yesterday" in a chunk is
+    read against the second, and a question about an event against the first.
+    """
+    start, end, said = item.get("occurred_start"), item.get("occurred_end"), item.get("mentioned_at")
+    dates: list[str] = []
+    if start:
+        dates.append(f"occurred {start}" + (f" to {end}" if end and end != start else ""))
+    if said:
+        dates.append(f"mentioned {said}")
+    text = str(item.get("text", ""))
+    return f"[{'; '.join(dates)}] {text}" if dates else text
 
 
 async def _prune_round(
@@ -1934,7 +1944,11 @@ async def _prune_round(
                     texts.append(_evidence_line(item))
         for chunk_id, chunk in (data.get("chunks") or {}).items():
             slots.append((i, "chunks", str(chunk_id)))
-            texts.append(str(chunk.get("chunk_text", "")) if isinstance(chunk, dict) else str(chunk))
+            texts.append(
+                _evidence_line({**chunk, "text": chunk.get("chunk_text", "")})
+                if isinstance(chunk, dict)
+                else str(chunk)
+            )
     if len(texts) < 2:
         return tool_results
     try:
@@ -2295,9 +2309,10 @@ def _with_cited_handles(tools: list[dict[str, Any]], presenter: ToolResultPresen
                 properties[field] = {
                     **properties[field],
                     "items": {"type": "string", **({"enum": handles} if handles else {})},
-                    # Gated like every maxItems (HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS): Bedrock
-                    # and Anthropic's native structured output reject the keyword.
-                    **({"maxItems": len(handles)} if get_config().llm_supports_max_items else {}),
+                    # Emitted like every other maxItems: providers that reject the keyword
+                    # (Anthropic) strip it themselves. It used to be gated on
+                    # llm_supports_max_items, which #6164 removed.
+                    "maxItems": len(handles),
                 }
                 if field not in required:
                     required.append(field)

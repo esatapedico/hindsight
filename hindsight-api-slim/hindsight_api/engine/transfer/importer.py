@@ -28,6 +28,7 @@ from datetime import UTC, date, datetime
 from typing import IO, TYPE_CHECKING, Any, Literal, cast
 
 from ...schema_context import get_current_schema
+from .. import bank_aliases
 from ..causal_links import CANONICAL_CAUSAL_LINK_TYPE, LEGACY_CAUSAL_LINK_TYPES
 from ..db.ops_postgresql import pg_search_vector_expr
 from ..db_utils import acquire_with_retry
@@ -49,7 +50,6 @@ from ..retain.types import (
 )
 from ..schema import fq_table
 from .schema import (
-    CARRIED_HISTORY_TABLES,
     HISTORY_TABLES,
     SCHEMA_VERSION,
     BankRowsJSONEncoding,
@@ -597,9 +597,7 @@ def parse_bank_archive(zf: zipfile.ZipFile) -> ParsedBankArchive:
         raise ValueError(
             f"Not a whole-bank archive (archive_type={manifest.archive_type!r}); use import_documents instead"
         )
-    bank_rows = {
-        table: _read_json(zf, f"{table}.json") for table in ("banks", *_BANK_CHILD_TABLES, *CARRIED_HISTORY_TABLES)
-    }
+    bank_rows = {table: _read_json(zf, f"{table}.json") for table in ("banks", *_BANK_CHILD_TABLES)}
     # Typed tree — absent on pre-tree archives, which restore with no pages.
     knowledge_pages = [TransferKnowledgePage.model_validate(p) for p in _read_json(zf, "knowledge_pages.json")]
     attachments = [TransferAttachment.model_validate(a) for a in _read_json(zf, "attachments.json")]
@@ -1194,7 +1192,8 @@ async def import_bank(
     The **target bank must not already exist**: import restores a complete bank
     (config + facts + mental models + …) and is not a merge. If a bank with the
     target id is present, this raises — delete it first or pass ``target_bank_id``
-    for a fresh id. A migration restores *exact* state, so unlike the document
+    for a fresh id. Two restores racing into the same fresh id do not merge either: the
+    one whose bank row loses raises and writes nothing. A migration restores *exact* state, so unlike the document
     import it fires no retain webhooks and triggers no consolidation/graph
     maintenance: observations and mental models are restored as exported.
 
@@ -1274,13 +1273,15 @@ async def _restore_bank(
 
     # `internal_id` is a globally-unique (banks_internal_id_unique) local identifier
     # used only for per-bank index naming — it is NOT part of the bank's logical
-    # state and nothing in the archive references it. Drop it so the column DEFAULT
-    # (gen_random_uuid) mints a fresh one on insert. Keeping the source value makes
-    # the banks INSERT collide with the source bank on a same-instance re-import,
-    # where `ON CONFLICT DO NOTHING` then silently skips the parent row and every
-    # child (mental_models, …) trips its bank_id foreign key. See #3270.
+    # state and nothing in the archive references it. Replace it with a fresh one:
+    # keeping the source value makes the banks INSERT collide with the source bank
+    # on a same-instance re-import, where `ON CONFLICT DO NOTHING` then silently
+    # skips the parent row and every child (mental_models, …) trips its bank_id
+    # foreign key. See #3270. Minted here, not by the column default, so the
+    # restore can tell the row it wrote from one a concurrent restore wrote first.
+    minted_internal_id = str(uuid.uuid4())
     for row in parsed.bank_rows.get("banks", []):
-        row.pop("internal_id", None)
+        row["internal_id"] = minted_internal_id
         # A bank's default display name is its id (see create_bank_row_on_conn),
         # so restoring under a new id would leave the copy showing the *source's*
         # id as its name — two banks reading as the same one in any list that
@@ -1311,6 +1312,9 @@ async def _restore_bank(
                     f"Target bank '{bank_id}' already exists; import-bank restores into a fresh bank "
                     f"(it is not a merge). Delete the bank first, or pass a different target bank id."
                 )
+            # The config path below writes the archived banks row itself, past the create
+            # path's alias check, so the check runs here for both paths.
+            await bank_aliases.refuse_alias_as_bank_id_on_conn(conn, bank_id)
             # Bank row first — children (documents, mental_models, …) FK to it. Without
             # the config component there is no row to restore, so the bank is created
             # with this instance's defaults and the data lands inside it.
@@ -1322,7 +1326,24 @@ async def _restore_bank(
                     bank_rows_json_encoding=bank_rows_json_encoding,
                 )
             else:
-                await bank_utils.create_bank_row_on_conn(conn, bank_id, ops=ops)
+                created = await bank_utils.create_bank_row_on_conn(conn, bank_id, ops=ops)
+            internal_id = await conn.fetchval(
+                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id
+            )
+            if internal_id is None:
+                raise ValueError("The archive's bank config carries no bank row to restore.")
+            if restoring.bank_config:
+                created = str(internal_id) == minted_internal_id
+            # Two restores into the same fresh id both pass the existence check above,
+            # since neither has committed. The loser's insert waits for the winner and
+            # then inserts nothing; carrying on would write a second copy of every fact
+            # into the winner's bank. Refused before `on_bank_created`, so the loser
+            # never marks the bank as its own (a crash-retry would delete it).
+            if not created:
+                raise ValueError(
+                    f"Target bank '{bank_id}' was created by another restore while this one ran; "
+                    f"nothing was restored. Pass a different target bank id to restore this archive too."
+                )
             if on_bank_created is not None:
                 await on_bank_created(conn)
             # The restored banks row bypasses the fresh-INSERT gate that normally
@@ -1339,11 +1360,7 @@ async def _restore_bank(
             # store owns this bank's memories — the restored facts go to the store, so
             # there is nothing here to index (#4615). Both are decided inside
             # create_bank_vector_indexes, so this call stays unconditional.
-            internal_id = await conn.fetchval(
-                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id
-            )
-            if internal_id is not None:
-                await bank_utils.create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
+            await bank_utils.create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
 
     # Only now does the bank row — and with it the archive's own config — exist, so
     # this is where the config the documents are replayed with has to come from.
@@ -1374,7 +1391,7 @@ async def _restore_bank(
             # Every unit id the rows restored below can cite, so only those are remapped.
             keep_unit_ids=_referenced_ids(
                 parsed.bank_rows.get("mental_models", []),
-                parsed.bank_rows.get("mental_model_history", []),
+                _iter_json_array(zf, "mental_model_history.json"),
                 _iter_json_array(zf, "data/graph_maintenance_queue.json"),
                 _iter_json_array(zf, "data/invalidated_memory_units.json"),
             ),
@@ -1391,7 +1408,6 @@ async def _restore_bank(
     # references before insertion so current and historical based_on data points
     # at the target bank's units rather than the source bank's units.
     _remap_mental_model_evidence(parsed.bank_rows.get("mental_models", []), unit_id_map)
-    _remap_mental_model_evidence(parsed.bank_rows.get("mental_model_history", []), unit_id_map)
 
     # Re-embed restored mental models off-connection (the source embedding was
     # stripped on export), so no DB connection is held across the embedding call.
@@ -1435,10 +1451,14 @@ async def _restore_bank(
             # restored rows (native search_vector already repopulated on insert).
             await _apply_mental_model_derived_state(conn, bank_id, mm_embeddings, config)
             # Restored after mental_models so the (mental_model_id, bank_id) FK resolves.
+            # Streamed: every refresh stores a full snapshot, so the history can run to
+            # gigabytes (#6259).
             result.mental_model_history_imported = await _restore_rows(
                 conn,
                 "mental_model_history",
-                parsed.bank_rows.get("mental_model_history", []),
+                _remapped_evidence(
+                    _retargeted_history(_iter_json_array(zf, "mental_model_history.json"), bank_id), unit_id_map
+                ),
                 bank_rows_json_encoding=bank_rows_json_encoding,
             )
             # Knowledge-base tree after its backing mental models exist (page FK) and
@@ -1691,6 +1711,7 @@ async def _import_document_batch(
                     document.retain_params,
                     document.tags,
                     ops=ops,
+                    store_document_text=config.store_document_text,
                 )
                 if document.created_at is not None:
                     # Transfer archives carry source provenance. Apply it here,
@@ -1706,7 +1727,12 @@ async def _import_document_batch(
                 chunk_id_map: dict[int, str] = {}
                 if doc.chunk_meta:
                     chunk_id_map = await chunk_storage.store_chunks_batch(
-                        conn, bank_id, doc.target_id, doc.chunk_meta, ops=ops
+                        conn,
+                        bank_id,
+                        doc.target_id,
+                        doc.chunk_meta,
+                        ops=ops,
+                        store_document_text=config.store_document_text,
                     )
 
                 for extracted, processed in zip(doc.extracted_facts, doc.processed_facts):
@@ -2045,7 +2071,14 @@ def _remap_based_on_ids(payload: dict[str, Any] | None, unit_id_map: dict[str, s
                     entry["id"] = unit_id_map[source_id]
 
 
-def _remap_mental_model_evidence(rows: list[dict], unit_id_map: dict[str, str]) -> None:
+def _remapped_evidence(rows: Iterable[dict], unit_id_map: dict[str, str]) -> Iterator[dict]:
+    """:func:`_remap_mental_model_evidence` for a stream of rows."""
+    for row in rows:
+        _remap_mental_model_evidence((row,), unit_id_map)
+        yield row
+
+
+def _remap_mental_model_evidence(rows: Iterable[dict], unit_id_map: dict[str, str]) -> None:
     """Repair current and historical mental-model reflect-response evidence.
 
     Handles both row shapes. A ``mental_models`` row carries the response in its

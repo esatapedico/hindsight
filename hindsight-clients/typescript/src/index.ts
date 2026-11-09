@@ -81,6 +81,7 @@ import type {
   MentalModelResponse,
   MentalModelTriggerInput,
   MentalModelDryRunRefreshResult,
+  UpdateDocumentRequest,
   UpdateDocumentResponse,
   VersionResponse,
 } from "../generated/types.gen";
@@ -962,6 +963,8 @@ export class HindsightClient {
       retainChunkBatchSize?: number;
       /** Persist the original document text alongside extracted facts. */
       storeDocumentText?: boolean;
+      /** IANA zone (e.g. "Europe/Rome") a retain time with no UTC offset is read in. */
+      defaultTimezone?: string;
       /** Cap on observations retained per scope (-1 for unlimited). */
       maxObservationsPerScope?: number;
       /** Per-scope observation caps, overriding maxObservationsPerScope. */
@@ -976,7 +979,7 @@ export class HindsightClient {
         | string[][];
       /** Consolidate automatically after retain() rather than on demand. */
       enableAutoConsolidation?: boolean;
-      /** When the server has a decision model, let it settle restatements, new facts and chatter before the consolidation LLM call. */
+      /** When the server has a decision model, let it settle restatements and chatter before the consolidation LLM call. */
       consolidationUseDecisionModel?: boolean;
       /** Number of LLM calls to batch during consolidation. */
       consolidationLlmBatchSize?: number;
@@ -992,7 +995,7 @@ export class HindsightClient {
       mentalModelMinRefreshIntervalSeconds?: number;
       /** Trigger fields merged over the built-in default for new knowledge pages. */
       knowledgePageDefaultTrigger?: Record<string, unknown>;
-      /** Default reflect options for this bank, applied whenever a reflect request (or a mental model's trigger) leaves the option unset: reflect_search_observations_max_tokens, reflect_search_observations_include_entities, reflect_search_mental_models_max_tokens. */
+      /** Default reflect options for this bank, applied whenever a reflect request leaves the option unset (mental-model refreshes use their trigger instead): reflect_search_observations_max_tokens, reflect_search_observations_include_entities, reflect_search_mental_models_max_tokens. */
       reflectDefaultOptions?: Record<string, unknown>;
       /** When the server has a decision model, reflect lets it prune the evidence and decide when to stop (fewer LLM calls). False keeps agent turns. */
       reflectUseDecisionModel?: boolean;
@@ -1083,6 +1086,7 @@ export class HindsightClient {
       updates.retain_chunk_batch_size = options.retainChunkBatchSize;
     if (options.storeDocumentText !== undefined)
       updates.store_document_text = options.storeDocumentText;
+    if (options.defaultTimezone !== undefined) updates.default_timezone = options.defaultTimezone;
     if (options.maxObservationsPerScope !== undefined)
       updates.max_observations_per_scope = options.maxObservationsPerScope;
     if (options.observationScopeLimits !== undefined)
@@ -1833,17 +1837,29 @@ export class HindsightClient {
   }
 
   /**
-   * Update a document's mutable fields.
+   * Update a document's mutable fields. `tags` replaces the whole set; `addTags` /
+   * `removeTags` change only the tags they name (removals first) and can't be combined with it.
    */
   async updateDocument(
     bankId: string,
     documentId: string,
-    options: { tags?: string[]; signal?: AbortSignal }
+    options: {
+      tags?: string[];
+      addTags?: string[];
+      removeTags?: string[];
+      observationScopes?: UpdateDocumentRequest["observation_scopes"];
+      signal?: AbortSignal;
+    }
   ): Promise<UpdateDocumentResponse> {
     const response = await sdk.updateDocument({
       client: this.client,
       path: { bank_id: bankId, document_id: documentId },
-      body: { tags: options.tags },
+      body: {
+        tags: options.tags,
+        add_tags: options.addTags,
+        remove_tags: options.removeTags,
+        observation_scopes: options.observationScopes,
+      },
       signal: options.signal,
     });
 

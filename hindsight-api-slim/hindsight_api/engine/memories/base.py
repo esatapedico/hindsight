@@ -734,6 +734,34 @@ def build_fact_records(
     return records
 
 
+def watermark_may_postdate(last_refreshed_at: datetime | None, watermark: datetime | None) -> bool:
+    """Cheap half of staleness: rule a model current from the bank watermark alone.
+
+    False is exact — nothing in the bank has been written since the model last
+    read the memories, so nothing in its scope has either, and no scoped query is
+    needed. True means only that *something* was written, possibly outside the
+    model's tags, so it is a signal to go and ask
+    (:func:`_mental_model_stale_scope` plus the store's scoped check), never an
+    answer to report. Surfaces used to report it as "may need refresh" because
+    asking per model was expensive; they now ask the scoped question instead
+    (#3291), and this stays what it always was — a free way to skip it. Every
+    staleness caller runs it first (#4169): the scoped check is bounded by the
+    writes since the model's own watermark, so a model this settles is exactly the
+    one that would have paid the most to be asked.
+    """
+    if last_refreshed_at is None:
+        return True  # Never refreshed — nothing to be current with.
+    if watermark is None:
+        return False  # Empty bank.
+    # Oracle's TIMESTAMP columns come back naive while the bank watermark is aware;
+    # compare both in UTC, as engine/reflect/tools.py already does for last_refreshed_at.
+    if last_refreshed_at.tzinfo is None:
+        last_refreshed_at = last_refreshed_at.replace(tzinfo=timezone.utc)
+    if watermark.tzinfo is None:
+        watermark = watermark.replace(tzinfo=timezone.utc)
+    return watermark > last_refreshed_at
+
+
 @dataclass(frozen=True)
 class MemoryScopeWatermark:
     """One "has this scope changed?" question, for the batched staleness check.
@@ -1069,7 +1097,9 @@ class EntityResolverHandle(Protocol):
 
     def discard_pending_stats(self) -> None: ...
 
-    async def flush_pending_stats(self) -> None: ...
+    def forget_pending_mentions(self, entity_ids: list[str]) -> None: ...
+
+    async def flush_pending_stats(self, conn: Any | None = None) -> None: ...
 
     async def reassert_entities_batch(self, bank_id: str, resolved_entities: list[Any], conn) -> None: ...
 
@@ -1491,10 +1521,18 @@ class MemoriesExtension(Extension, ABC):
         file_content_type: str = "",
         file_original_name: str = "",
         expect_content_hash: "str | None" = None,
+        keep_chunk_text: bool = True,
     ) -> None:
         """Store (or replace) a document's bodies: its extracted text, its ordered chunk texts, and
         optionally the original uploaded file. Idempotent by content — re-ingest re-uploads only
         what changed.
+
+        ``keep_chunk_text=False`` is a bank with ``store_document_text`` off: the store keeps each
+        chunk's hash, computed from the text passed here, but not the text, and every chunk reads
+        back as empty — what the SQL path stores. The hashes are what delta retain diffs a re-send
+        against, so they must be those of the real text. A caller restoring a prefix it cannot read
+        back (see ``_store_document_bodies``) passes those chunks as ``""``, and the store keeps
+        their hashes from the record being replaced.
 
         ``chunk_texts`` REPLACES the document's chunk list, so a caller holding only part of a
         document (a retain sub-batch) must send the whole list, not its slice — see
@@ -2241,6 +2279,44 @@ class MemoriesExtension(Extension, ABC):
         """
         raise NotImplementedError
 
+    async def mental_model_is_stale(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        scope: MemoryScopeWatermark,
+        cited_ids: list[str],
+    ) -> bool:
+        """Whether a memory in ``scope`` was written after ``scope.since``, or any of ``cited_ids`` is gone.
+
+        The whole store-side question behind a single mental model's staleness, asked
+        as one call so a store can answer its parts together. The three reads it is
+        made of — the bank watermark, the scoped existence check, the liveness of the
+        cited ids — are independent apart from the watermark gating the scoped check,
+        and a store that pays a network round trip per read pays them in series here.
+
+        The default asks them in series on ``conn``, which is the only correct shape
+        for a store whose reads share one connection. Override it when the reads can
+        run concurrently.
+        """
+        watermark = await self.latest_memory_write_at(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        if watermark_may_postdate(scope.since, watermark) and await self.any_memory_updated_since(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            since=scope.since,
+            fact_types=scope.fact_types,
+            tags=scope.tags,
+            tags_match=scope.tags_match,
+            tag_groups=scope.tag_groups,
+        ):
+            return True
+        if not cited_ids:
+            return False
+        live = await self.live_memory_ids(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids)
+        return len(live) < len(cited_ids)
+
     # ------------------------------------------------------------------ count surfaces
     #
     # The stats/admin views that aggregate memories by a key: consolidation
@@ -2265,6 +2341,11 @@ class MemoriesExtension(Extension, ABC):
         this up to date" for many models without a scoped scan each.
         """
         raise NotImplementedError
+
+    async def has_pending_consolidation(self, *, conn, fq_table, bank_id: str) -> bool:
+        """Whether the bank has any facts that can still be consolidated."""
+        freshness = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return bool(freshness.get("pending"))
 
     async def document_memory_counts(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
         """Live memory count per document id, for the documents named. Absent = 0."""
@@ -3009,8 +3090,15 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_document_record(bank_id=bank_id, document_id=document_id)
         return DeletedDocument(deleted=_record is not None, file_storage_key=file_storage_key)
 
-    async def current_document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> DocumentTags:
+    async def current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_id: str, for_update: bool = False
+    ) -> DocumentTags:
         """The tags a document carries now, read before a retag overwrites them.
+
+        ``for_update`` asks the store to hold the document until ``conn``'s transaction ends, so
+        a tag change decided from this read (a partial add/remove, or whether a full write must
+        retag the memories) is not undone by a concurrent one. The default record-based read
+        cannot lock and ignores it.
 
         Default: the store's record. A record that does not carry a "tags" key at all is
         unreadable for this purpose, not empty — collapsing it to [] would read a PATCH of []
@@ -3020,6 +3108,25 @@ class MemoriesExtension(Extension, ABC):
             found=_record is not None,
             tags=list(_record["tags"] or []) if _record is not None and "tags" in _record else None,
         )
+
+    async def existing_documents_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> dict[str, list[str] | None]:
+        """document id -> its tags, for the ids that exist; ``None`` when the record exists but
+        carries no tags (same meaning as :meth:`current_document_tags`). Read to check a retain
+        batch's writes into existing documents, so an id left out is a new document.
+
+        Default: :meth:`current_document_tags` per id. Not :meth:`documents_tags`: that one
+        leaves out a record without a "tags" key, so a restricted writer's retain would read it
+        as a new document and be let through (#6327). Postgres reads all the rows at once."""
+        out: dict[str, list[str] | None] = {}
+        for document_id in document_ids:
+            current = await self.current_document_tags(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
+            )
+            if current.found:
+                out[document_id] = current.tags
+        return out
 
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         """document id -> the tags it carries, for the ids that exist. Read to decide whether a
@@ -3518,10 +3625,17 @@ class MemoriesExtension(Extension, ABC):
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id, include_text=include_text)
         return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=include_text)
 
-    async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:
-        """The document's chunks (id, index, content hash), in chunk order."""
+    async def load_existing_chunks(
+        self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+    ) -> list[ExistingChunk]:
+        """The document's chunks (id, index, content hash), in chunk order; ``chunk_indices`` limits
+        the result to those positions."""
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id)
-        return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        chunks = document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        if chunk_indices is None:
+            return chunks
+        wanted = set(chunk_indices)
+        return [c for c in chunks if c.chunk_index in wanted]
 
     async def current_document_hash(self, *, backend, fq_table, bank_id: str, document_id: str) -> str | None:
         """The document's content_hash now, for the delta's pre-extraction recheck. ``backend`` is
@@ -4069,8 +4183,8 @@ class MemoriesExtension(Extension, ABC):
 
     async def expand_memories(self, *, conn, fq_table, bank_id: str, unit_ids: list[uuid.UUID]) -> list:
         """``id`` (a UUID), ``text``, ``chunk_id``, ``document_id``, ``fact_type``, ``context``,
-        ``tags`` for each of ``unit_ids`` that exists, as mappings. Postgres returns its rows as
-        they are."""
+        ``tags``, ``occurred_start``, ``occurred_end``, ``mentioned_at`` for each of ``unit_ids``
+        that exists, as mappings. Postgres returns its rows as they are."""
         stored = await self.get_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(u) for u in unit_ids]
         )
@@ -4083,6 +4197,9 @@ class MemoriesExtension(Extension, ABC):
                 "fact_type": s.fact_type,
                 "context": s.context,
                 "tags": s.tags,
+                "occurred_start": s.occurred_start,
+                "occurred_end": s.occurred_end,
+                "mentioned_at": s.mentioned_at,
             }
             for s in stored
         ]

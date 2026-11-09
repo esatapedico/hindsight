@@ -266,10 +266,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
     Call initialize() during startup to load the model and avoid cold starts.
 
-    Default model is cross-encoder/ms-marco-MiniLM-L-6-v2:
-    - Fast inference (~80ms for 100 pairs on CPU)
-    - Small model (80MB)
-    - Trained for passage re-ranking
+    Default model is hindsight-ai/hs-rerank-1:
+    - Multilingual (en, es, fr, de, pt, ja, ko, zh)
+    - Small model (114M parameters, a 15M-parameter transformer per pass)
+    - Trained for Hindsight memory re-ranking
 
     Uses a dedicated thread pool to limit concurrent CPU-bound work.
     """
@@ -294,7 +294,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
         Args:
             model_name: Name of the CrossEncoder model to use.
-                       Default: cross-encoder/ms-marco-MiniLM-L-6-v2
+                       Default: hindsight-ai/hs-rerank-1
             max_concurrent: Maximum concurrent reranking calls (default: 2).
                            Higher values may cause CPU thrashing under load.
             force_cpu: Force CPU mode for local inference.
@@ -397,11 +397,17 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                 transformers_logger.setLevel(logging.ERROR)
 
                 try:
+                    import torch
+
+                    # Raw logits, as the other providers return: recall applies the sigmoid.
+                    # sentence-transformers otherwise defaults single-label models to Sigmoid,
+                    # and the second sigmoid squashes every score into 0.5..0.73.
                     self._model = CrossEncoder(
                         self.model_name,
                         device=device,
                         model_kwargs={"low_cpu_mem_usage": False},
                         trust_remote_code=self.trust_remote_code,
+                        activation_fn=torch.nn.Identity(),
                     )
                 finally:
                     # Restore original logging level
@@ -409,8 +415,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
             # Safetensors weights are mapped zero-copy and can land on a byte offset that
             # is not a multiple of the dtype size, which makes torch's vectorized CPU matmul
-            # return corrupt scores. See engine/local_device.py. The default reranker
-            # (ms-marco-MiniLM-L-6-v2) is one of the affected files.
+            # return corrupt scores. See engine/local_device.py. ms-marco-MiniLM-L-6-v2 is
+            # one of the affected files.
             align_local_model_weights(self._model.model, label=f"Reranker[{self.model_name}]")
 
             self._device_type = resolve_model_device_type(self._model)
@@ -1383,6 +1389,12 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
 
     async def _rank_once(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
         """Rank one group of candidates, returning their indices best first."""
+        # Jev rejects a Choice with fewer than two options ("criteria must map 2 or more
+        # options"), and one candidate is already ranked. Guarded here, where every round
+        # (single pool, preliminaries, finals) asks, so a bank holding one memory does not
+        # fail recall with a 400.
+        if len(indices) < 2:
+            return list(indices)
         body = {
             "state": f"Question: {query}",
             "model": self.model,
@@ -1505,25 +1517,31 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             count_tokens(_SUFFICIENCY_INSTRUCTIONS) + sum(count_tokens(level) for level in self.SUFFICIENCY_LEVELS) + 50
         )
         prefix = f"Question: {query}\n\nEvidence:\n"
+        policy = self.retry_policy or RetryPolicy()
 
         async def ask(question_budget: int) -> dict:
             budget = max(100, question_budget - overhead - count_tokens(prefix))
             # ponytail: keeps the head of the evidence; the agent's own results come
             # first (pages, then observations, then facts), so the tail is raw facts.
             fitted = truncate_to_tokens(evidence, budget).text if count_tokens(evidence) > budget else evidence
-            return await self._ask(
-                {
-                    "state": f"{prefix}{fitted}",
-                    "model": self.model,
-                    "questions": {
-                        "sufficient": {
-                            "type": "score",
-                            "instructions": _SUFFICIENCY_INSTRUCTIONS,
-                            "criteria": self.SUFFICIENCY_LEVELS,
-                        }
-                    },
+            body = {
+                "state": f"{prefix}{fitted}",
+                "model": self.model,
+                "questions": {
+                    "sufficient": {
+                        "type": "score",
+                        "instructions": _SUFFICIENCY_INSTRUCTIONS,
+                        "criteria": self.SUFFICIENCY_LEVELS,
+                    }
                 },
-                "decision_evidence_sufficiency",
+            }
+            # Retried as the page-impact question is: a rate limit read as "not enough" bought
+            # the agent turns the decision model exists to save.
+            return await acall_with_retry(
+                lambda: self._ask(body, "decision_evidence_sufficiency"),
+                policy=policy,
+                budget=policy.new_budget(),
+                provider=self.provider_name,
             )
 
         result = await self._within_window(ask)

@@ -460,6 +460,12 @@ class LLMStub:
         self._install_builtins()
 
 
+@dataclass(frozen=True)
+class EmbeddingCall:
+    model: str
+    inputs: list[str]
+
+
 class EmbeddingStub:
     """Deterministic embeddings — see ``lexical.py`` for why word overlap suffices."""
 
@@ -467,10 +473,15 @@ class EmbeddingStub:
     #: stories about what the server leaves behind when its embeddings backend is down.
     fail_with_status: int | None = None
 
-    def embed(self, text: str) -> list[float]:
+    def __init__(self) -> None:
+        #: Every embeddings request, in arrival order: which model was asked for which
+        #: texts. Lets a story check which embedder a server sent a text to.
+        self.calls: list[EmbeddingCall] = []
+
+    def embed(self, text: str, dimension: int) -> list[float]:
         from .lexical import lexical_embedding
 
-        return lexical_embedding(text)
+        return lexical_embedding(text, dimension)
 
 
 class RerankStub:
@@ -494,10 +505,18 @@ class RerankStub:
     #: as (text in Memory A, text in Memory B). Every other pair is not a repeat.
     repeats: set[tuple[str, str]]
 
+    #: The candidates of every ranking question, as the decision model read them.
+    ranked: list[str]
+
+    #: Answer every decision-model request with this provider error instead, for the
+    #: stories about a recall whose decision model fails. The /rerank endpoint ignores it.
+    fail_with_status: int | None = None
+
     def __init__(self) -> None:
         self.verdicts = {}
         self.states = []
         self.repeats = set()
+        self.ranked = []
 
     def repeat(self, memory_a: str, memory_b: str) -> float:
         return 0.9 if any(a in memory_a and b in memory_b for a, b in self.repeats) else 0.1
@@ -517,27 +536,20 @@ class TriageStub:
 
     Triage asks TypeSafe, per new fact, how it relates to the observations shown
     (``relation``), which one it restates (``match`` / ``covers_oN``) and which it makes
-    should be reworded (``touches_oN``); under a bank's own mission also whether the mission
-    would keep the fact as stated (``keep_as``); every judgment is a choice. A story names the verdict for a
-    fact by a phrase in its text; every other fact gets "changes" with nothing flagged
-    and no mission fit, which hands it to the LLM — what an unconfigured stub must do so
+    should be reworded (``touches_oN``); every judgment is a choice. A story names the verdict
+    for a fact by a phrase in its text; every other fact gets "changes" with nothing flagged,
+    which hands it to the LLM — what an unconfigured stub must do so
     no story is settled by accident.
     """
 
     def __init__(self) -> None:
         self.verdicts: dict[str, str] = {}
-        #: Phrases of facts the bank's mission wants, worded as it allows.
-        self.fits_mission: set[str] = set()
 
     def relation(self, fact_text: str) -> str:
         return next((v for phrase, v in self.verdicts.items() if phrase in fact_text), "changes")
 
-    def fits(self, fact_text: str) -> bool:
-        return any(phrase in fact_text for phrase in self.fits_mission)
-
     def reset(self) -> None:
         self.verdicts.clear()
-        self.fits_mission.clear()
 
 
 @dataclass(frozen=True)
@@ -591,10 +603,12 @@ class Stubs:
         go back to its default or it leaks into whatever runs next."""
         self.llm.reset()
         self.embeddings.fail_with_status = None
+        self.embeddings.calls.clear()
         self.rerank.cut_level = RerankStub.cut_level
         self.rerank.verdicts = {}
         self.rerank.states = []
         self.rerank.repeats = set()
+        self.rerank.fail_with_status = None
         self.triage.reset()
         self.rejected_requests.clear()
         self.webhooks.clear()
